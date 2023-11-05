@@ -1211,26 +1211,22 @@ class RequestHistoryManager:
 
         try:
             stmt = select(
-                models.Request.account,
                 models.Request.state,
                 models.Request.dest_rse_id,
                 models.Request.source_rse_id,
-                models.Request.activity,
-                models.Request.requested_at,
+                models.Request.created_at,
                 func.sum(models.Request.bytes).label('bytes')
             ).with_hint(
                 models.Request, "INDEX(REQUESTS REQUESTS_TYP_STA_UPD_IDX)", 'oracle'
             ).where(
                 models.Request.state.in_(state),
                 models.Request.request_type.in_([RequestType.TRANSFER, RequestType.STAGEIN, RequestType.STAGEOUT]),
-                models.Request.requested_at >= requested_at,
+                models.Request.created_at >= requested_at,
             ).group_by(
-                models.Request.account,
                 models.Request.state,
                 models.Request.dest_rse_id,
                 models.Request.source_rse_id,
-                models.Request.activity,
-                models.Request.requested_at,
+                models.Request.created_at,
             )
 
             return session.execute(stmt).all()
@@ -1258,6 +1254,7 @@ class RequestHistoryManager:
         for db_stat in db_stats:
             if (db_stat.dest_rse_id not in topology) or (db_stat.source_rse_id and db_stat.source_rse_id not in topology):
                 # The RSE was deleted. Ignore
+                print("rse was deleted")
                 continue
 
             dst_node = topology[db_stat.dest_rse_id]
@@ -1268,6 +1265,6 @@ class RequestHistoryManager:
             else:
                 request_history[dst_node]['files_done'] += 1
 
-            request_history[dst_node]['bytes'] += db_stat.bytes
+            request_history[dst_node]['bytes'] += Decimal(db_stat.bytes)
 
         return request_history

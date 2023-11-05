@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from datetime import datetime, timedelta
 import pytest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -20,11 +21,12 @@ from rucio.common.exception import NoDistance
 from rucio.core.distance import add_distance
 from rucio.core.replica import add_replicas
 from rucio.core.request import list_and_mark_transfer_requests_and_source_replicas
-from rucio.core.transfer import build_transfer_paths, ProtocolFactory
+from rucio.core.transfer import build_transfer_paths, ProtocolFactory, RequestHistoryManager
 from rucio.core.topology import get_hops, Topology
 from rucio.core import rule as rule_core
 from rucio.core import request as request_core
 from rucio.core import rse as rse_core
+from rucio.db.sqla import models
 from rucio.db.sqla.constants import RSEType, RequestState
 from rucio.db.sqla.session import get_session
 from rucio.common.utils import generate_uuid
@@ -377,3 +379,65 @@ def test_fk_error_on_source_creation(rse_factory, did_factory, root_account):
     transfer_path[0].rws.request_id = generate_uuid()
     to_submit, *_ = assign_paths_to_transfertool_and_create_hops(requests, default_tombstone_delay=0)
     assert not to_submit
+
+def test_request_history(rse_factory):
+    # +------+    +------+
+    # |      | 10 |      |
+    # | RSE0 +--->| RSE1 |
+    # |      |    |      +-+ 10
+    # +------+    +------+ |  +------+       +------+
+    #                      +->|      |  200  |      |
+    # +------+                | RSE3 |<------| RSE4 |
+    # |      |   30      +--->|      |       |      |
+    # | RSE2 +-----------+    +------+       +------+
+    # |      |
+    # +------+
+
+    # Create mock topology
+    _, rse0_id = rse_factory.make_posix_rse()
+    _, rse1_id = rse_factory.make_posix_rse()
+    _, rse2_id = rse_factory.make_posix_rse()
+    rse3_name, rse3_id = rse_factory.make_posix_rse()
+    _, rse4_id = rse_factory.make_posix_rse()
+    all_rses = [rse0_id, rse1_id, rse2_id, rse3_id, rse4_id]
+
+    add_distance(rse0_id, rse1_id, distance=10)
+    add_distance(rse1_id, rse3_id, distance=10)
+    add_distance(rse2_id, rse3_id, distance=30)
+    add_distance(rse4_id, rse3_id, distance=200)
+    rse_core.add_rse_attribute(rse1_id, 'available_for_multihop', True)
+
+    topology = Topology(rse_ids=all_rses).configure_multihop()
+
+    # add mock data to request database
+    db_session = get_session()
+    request1 = models.Request(
+        state=RequestState.FAILED,
+        dest_rse_id=rse3_id,
+        source_rse_id=None,
+        bytes=100,
+        created_at=datetime.utcnow() - timedelta(minutes=30)
+    )
+    request2 = models.Request(
+        state=RequestState.DONE,
+        dest_rse_id=rse1_id,
+        source_rse_id=None,
+        bytes=100,
+        created_at=datetime.utcnow() - timedelta(minutes=30)
+    )
+    request1.save(session=db_session)
+    request2.save(session=db_session)
+    db_session.commit()
+    db_session.expunge(request1)
+    db_session.expunge(request2)
+
+    # Read request history
+    rhm = RequestHistoryManager(topology)
+
+    request_history = rhm._demand_from_requests()
+    print(f"len = {len(request_history)}")
+
+    for dest, d in request_history.items():
+        print(f"dest_node = {dest}")
+        for k, v in d.items():
+            print(f"\t{k}, {v}")
