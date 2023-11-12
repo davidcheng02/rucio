@@ -17,17 +17,22 @@ import itertools
 import logging
 import threading
 import weakref
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
+from decimal import Decimal
 from typing import TYPE_CHECKING, cast, Any, Generic, Optional, TypeVar, Union
 
 from sqlalchemy import and_, select
+from sqlalchemy.sql.expression import func
+from sqlalchemy.exc import IntegrityError
 
 from rucio.common.config import config_get_int, config_get
-from rucio.common.exception import NoDistance, RSEProtocolNotSupported, InvalidRSEExpression
+from rucio.common.exception import NoDistance, RSEProtocolNotSupported, InvalidRSEExpression, RucioException
 from rucio.common.utils import PriorityQueue
 from rucio.core.rse import RseCollection, RseData
 from rucio.core.rse_expression_parser import parse_expression
 from rucio.db.sqla import models
+from rucio.db.sqla.constants import RequestState, RequestType
 from rucio.db.sqla.session import read_session, transactional_session
 from rucio.rse import rsemanager as rsemgr
 
@@ -130,6 +135,10 @@ class Topology(RseCollection, Generic[TN, TE]):
         self.ignore_availability = ignore_availability
 
         self._lock = threading.RLock()
+        self._request_history_manager = RequestHistoryManager(self)
+
+    def get_request_history_last_hour(self) -> "defaultdict":
+        return self._request_history_manager.get_request_history(datetime.timedelta(hours=1))
 
     def get_or_create(self, rse_id: str) -> "TN":
         rse_data = self.rse_id_to_data_map.get(rse_id)
@@ -442,3 +451,72 @@ def get_hops(
         raise RSEProtocolNotSupported()
 
     return path
+
+class RequestHistoryManager:
+    def __init__(self, topology: "Topology"):
+        self.topology = topology
+
+    @read_session
+    def _get_request_stats(self, state, window: "datetime.timedelta", *, session: "Session"):
+        """
+        Retrieves statistics about requests by destination, activity, and state within the requested_at time bounds
+        """
+
+        if type(state) is not list:
+            state = [state]
+
+        try:
+            window_start = datetime.datetime.utcnow() - window
+            stmt = select(
+                models.Request.state,
+                models.Request.dest_rse_id,
+                models.Request.source_rse_id,
+                models.Request.created_at,
+                func.sum(models.Request.bytes).label('bytes')
+            ).with_hint(
+                models.Request, "INDEX(REQUESTS REQUESTS_TYP_STA_UPD_IDX)", 'oracle'
+            ).where(
+                models.Request.state.in_(state),
+                models.Request.request_type.in_([RequestType.TRANSFER, RequestType.STAGEIN, RequestType.STAGEOUT]),
+                models.Request.created_at >= window_start,
+                ).group_by(
+                models.Request.state,
+                models.Request.dest_rse_id,
+                models.Request.source_rse_id,
+                models.Request.created_at,
+            )
+
+            return session.execute(stmt).all()
+        except IntegrityError as error:
+            raise RucioException(error.args)
+
+    @read_session
+    def get_request_history(self, window: "datetime.timedelta", *, session: "Session") -> "defaultdict":
+        """
+        Scans requests table and returns request history information
+        """
+
+        topology = self.topology
+        db_stats = self._get_request_stats(
+            state=[RequestState.FAILED, RequestState.DONE],
+            window=window,
+            session=session,
+        )
+
+        # for each node, dictionary stores files done, files failed
+        request_history = defaultdict(lambda: defaultdict(Decimal))
+        for db_stat in db_stats:
+            if (db_stat.dest_rse_id not in topology) or (db_stat.source_rse_id and db_stat.source_rse_id not in topology):
+                # The RSE was deleted. Ignore
+                print("rse was deleted")
+                continue
+
+            dest_node_id = topology[db_stat.dest_rse_id].id
+            failed = (db_stat.state == RequestState.FAILED)
+
+            if failed:
+                request_history[dest_node_id]['files_failed'] += 1
+            else:
+                request_history[dest_node_id]['files_done'] += 1
+
+        return request_history

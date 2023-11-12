@@ -21,7 +21,7 @@ from rucio.common.exception import NoDistance
 from rucio.core.distance import add_distance
 from rucio.core.replica import add_replicas
 from rucio.core.request import list_and_mark_transfer_requests_and_source_replicas
-from rucio.core.transfer import build_transfer_paths, ProtocolFactory, RequestHistoryManager
+from rucio.core.transfer import build_transfer_paths, ProtocolFactory
 from rucio.core.topology import get_hops, Topology
 from rucio.core import rule as rule_core
 from rucio.core import request as request_core
@@ -432,12 +432,11 @@ def test_request_history(rse_factory):
     db_session.expunge(request2)
 
     # Read request history
-    rhm = RequestHistoryManager(topology)
+    request_history = topology.get_request_history_last_hour()
+    assert len(request_history) == 2
 
-    request_history = rhm._demand_from_requests()
-    print(f"len = {len(request_history)}")
-
-    for dest, d in request_history.items():
-        print(f"dest_node = {dest}")
-        for k, v in d.items():
-            print(f"\t{k}, {v}")
+    for node_id, attributes in request_history.items():
+        if node_id == rse3_id:
+            print(attributes.get("files_failed"))
+        if node_id == rse1_id:
+            print(attributes.get("files_done"))

@@ -18,15 +18,12 @@ import logging
 import re
 import time
 import traceback
-from collections import defaultdict
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from dogpile.cache import make_region
 from dogpile.cache.api import NoValue
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.sql.expression import func
 
 from rucio.common import constants
 from rucio.common.config import config_get
@@ -1191,80 +1188,3 @@ def get_supported_transfertools(
         if tt_class and tt_class.can_perform_transfer(source_rse, dest_rse):
             result.add(tt_name)
     return result
-
-class RequestHistoryManager:
-    def __init__(self, topology: "Topology"):
-        self.topology = topology
-
-    @read_session
-    def _get_request_stats(self, state, requested_at, *, session: "Session"):
-        """
-        Retrieves statistics about requests by destination, activity, and state within the requested_at time bounds
-        :param state:
-        :param requested_at:
-        :param session:
-        :return:
-        """
-
-        if type(state) is not list:
-            state = [state]
-
-        try:
-            stmt = select(
-                models.Request.state,
-                models.Request.dest_rse_id,
-                models.Request.source_rse_id,
-                models.Request.created_at,
-                func.sum(models.Request.bytes).label('bytes')
-            ).with_hint(
-                models.Request, "INDEX(REQUESTS REQUESTS_TYP_STA_UPD_IDX)", 'oracle'
-            ).where(
-                models.Request.state.in_(state),
-                models.Request.request_type.in_([RequestType.TRANSFER, RequestType.STAGEIN, RequestType.STAGEOUT]),
-                models.Request.created_at >= requested_at,
-            ).group_by(
-                models.Request.state,
-                models.Request.dest_rse_id,
-                models.Request.source_rse_id,
-                models.Request.created_at,
-            )
-
-            return session.execute(stmt).all()
-        except IntegrityError as error:
-            raise RucioException(error.args)
-    @read_session
-    def _demand_from_requests(self, *, session: "Session"):
-        """
-        Scans Requests table and returns current demand
-        :param session:
-        :return:
-        """
-
-        topology = self.topology
-        one_hour_ago = datetime.datetime.utcnow() - datetime.timedelta(hours=1)
-        db_stats = self._get_request_stats(
-            state=[RequestState.FAILED,
-                   RequestState.DONE],
-            requested_at=one_hour_ago,
-            session=session,
-        )
-
-        # dictionary stores files done, failed and bytes sent to each node
-        request_history = defaultdict(lambda: defaultdict(Decimal))
-        for db_stat in db_stats:
-            if (db_stat.dest_rse_id not in topology) or (db_stat.source_rse_id and db_stat.source_rse_id not in topology):
-                # The RSE was deleted. Ignore
-                print("rse was deleted")
-                continue
-
-            dst_node = topology[db_stat.dest_rse_id]
-            failed = (db_stat.state == RequestState.FAILED)
-
-            if failed:
-                request_history[dst_node]['files_failed'] += 1
-            else:
-                request_history[dst_node]['files_done'] += 1
-
-            request_history[dst_node]['bytes'] += Decimal(db_stat.bytes)
-
-        return request_history
