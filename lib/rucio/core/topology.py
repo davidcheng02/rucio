@@ -155,7 +155,7 @@ class Topology(RseCollection, Generic[TN, TE]):
         success_probability = files_done / (files_done + files_failed)
 
         if success_probability == Decimal(0):
-             return 1.0
+             return float("inf")
 
         return 1.0 / float(success_probability)
 
