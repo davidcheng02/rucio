@@ -140,6 +140,25 @@ class Topology(RseCollection, Generic[TN, TE]):
     def get_request_history_last_hour(self) -> "defaultdict":
         return self._request_history_manager.get_request_history(datetime.timedelta(hours=1))
 
+    def get_failure_penalty(self, rse_id: str) -> float:
+        """
+        Returns multiplicative penalty for failure
+        """
+        request_history = self.get_request_history_last_hour()
+
+        if rse_id not in request_history:
+            return 1.0
+
+        rse_history = request_history[rse_id]
+        files_done = rse_history["files_done"]
+        files_failed = rse_history["files_failed"]
+        success_probability = files_done / (files_done + files_failed)
+
+        if success_probability == Decimal(0):
+             return 1.0
+
+        return 1.0 / float(success_probability)
+
     def get_or_create(self, rse_id: str) -> "TN":
         rse_data = self.rse_id_to_data_map.get(rse_id)
         if rse_data is None:
@@ -515,8 +534,8 @@ class RequestHistoryManager:
             failed = (db_stat.state == RequestState.FAILED)
 
             if failed:
-                request_history[dest_node_id]['files_failed'] += 1
+                request_history[dest_node_id]["files_failed"] += 1
             else:
-                request_history[dest_node_id]['files_done'] += 1
+                request_history[dest_node_id]["files_done"] += 1
 
         return request_history
