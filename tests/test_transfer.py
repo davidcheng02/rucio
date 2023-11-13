@@ -440,3 +440,82 @@ def test_request_history(rse_factory):
             print(attributes.get("files_failed"))
         if node_id == rse1_id:
             print(attributes.get("files_done"))
+
+def test_failure_penalty(rse_factory):
+    # +------+    +------+
+    # |      | 10 |      |
+    # | RSE0 +--->| RSE1 |
+    # |      |    |      +-+ 10
+    # +------+    +------+ |  +------+       +------+
+    #                      +->|      |  200  |      |
+    # +------+                | RSE3 |<------| RSE4 |
+    # |      |   30      +--->|      |       |      |
+    # | RSE2 +-----------+    +------+       +------+
+    # |      |
+    # +------+
+
+    # Create mock topology
+    _, rse0_id = rse_factory.make_posix_rse()
+    _, rse1_id = rse_factory.make_posix_rse()
+    _, rse2_id = rse_factory.make_posix_rse()
+    rse3_name, rse3_id = rse_factory.make_posix_rse()
+    _, rse4_id = rse_factory.make_posix_rse()
+    all_rses = [rse0_id, rse1_id, rse2_id, rse3_id, rse4_id]
+
+    add_distance(rse0_id, rse1_id, distance=10)
+    add_distance(rse1_id, rse3_id, distance=10)
+    add_distance(rse2_id, rse3_id, distance=30)
+    add_distance(rse4_id, rse3_id, distance=200)
+    rse_core.add_rse_attribute(rse1_id, 'available_for_multihop', True)
+
+    topology = Topology(rse_ids=all_rses).configure_multihop()
+
+    # add mock data to request database
+    db_session = get_session()
+    request1 = models.Request(
+        state=RequestState.FAILED,
+        dest_rse_id=rse3_id,
+        source_rse_id=None,
+        bytes=100,
+        created_at=datetime.utcnow() - timedelta(minutes=30)
+    )
+    request2 = models.Request(
+        state=RequestState.DONE,
+        dest_rse_id=rse1_id,
+        source_rse_id=None,
+        bytes=100,
+        created_at=datetime.utcnow() - timedelta(minutes=30)
+    )
+    request1.save(session=db_session)
+    request2.save(session=db_session)
+    db_session.commit()
+    db_session.expunge(request1)
+    db_session.expunge(request2)
+
+    # have rse2 obtain a 60% failure rate
+    rse2_success = 2
+    rse2_total_requests = 5
+    for i in range(rse2_total_requests):
+        if i < rse2_success:
+            request_state = RequestState.DONE
+        else:
+            request_state = RequestState.FAILED
+
+        request = models.Request(
+            state=request_state,
+            dest_rse_id=rse2_id,
+            source_rse_id=None,
+            bytes=100,
+            created_at=datetime.utcnow() - timedelta(minutes=(45 - i))
+        )
+        request.save(session=db_session)
+        db_session.commit()
+        db_session.expunge(request)
+
+    # edge cases: 100% failure rate or 0% failure rate
+    rse3_failure_penalty = topology.get_failure_penalty(rse3_id)
+    assert(rse3_failure_penalty == float("inf"))
+    rse1_failure_penalty = topology.get_failure_penalty(rse1_id)
+    assert(rse1_failure_penalty == 1)
+    rse2_failure_penalty = topology.get_failure_penalty(rse2_id)
+    assert(rse2_failure_penalty == 1 / (rse2_success / rse2_total_requests))
