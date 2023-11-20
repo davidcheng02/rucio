@@ -286,3 +286,18 @@ def test_api_list(
 
     params = {'request_states': 'S', 'src_site': source_site, 'dst_site': 'unknown'}
     check_error_api(params, 'NotFound', 'Could not resolve site name unknown to RSE', 404)
+
+
+def test_api_stats(
+        vo,
+        rest_client,
+        auth_token,
+        rse_factory,
+        root_account
+):
+    api_endpoint = '/requests/stats'
+    source_rse, source_rse_id = rse_factory.make_mock_rse()
+    dest_rse, dest_rse_id = rse_factory.make_mock_rse()
+    params = {'state': 'Q', 'dst_rse': dest_rse, 'src_rse': source_rse}
+    headers_dict = {'X-Rucio-Type': 'user', 'X-Rucio-Account': root_account.external}
+    response = rest_client.get(api_endpoint, query_string=params, headers=headers(auth(auth_token), vohdr(vo), hdrdict(headers_dict)))
