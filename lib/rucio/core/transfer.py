@@ -1071,7 +1071,12 @@ class PreferSingleHop(PathDistance):
         return int(len(path) > 1)
 class FailureRate(SourceRankingStrategy):
     class _RankingContext(RequestRankingContext):
-        def __init__(self, strategy: "SourceRankingStrategy", rws: "RequestWithSources", failure_rate_for_rws: "Mapping[RseData, float]"):
+        def __init__(
+                self,
+                strategy: "SourceRankingStrategy",
+                rws: "RequestWithSources",
+                failure_rate_for_rws: "Mapping[RseData, float]"
+        ):
             super().__init__(strategy, rws)
             self.failure_rate_for_rws = failure_rate_for_rws
 
@@ -1097,17 +1102,16 @@ class FailureRate(SourceRankingStrategy):
         super().__init__()
 
         resolution = datetime.timedelta(hours=1)
-        self.totals = {}
+        self.source_stats = {}
         for stat in stats_manager.load_totals(
                 resolution=resolution,
                 recent_t=datetime.datetime.utcnow(),
                 older_t=datetime.datetime.utcnow() - resolution,
                 session=session
         ):
-            # for each request's dest_rse, store the stats of the src_rse_id corresponding to this request totals will
-            # be a dict of dicts, where key is dest_rse, and value is a dict of (key: src_rse, value: _FailureRateStat)
-            # we must aggregate the failure stats across all activity types for a src and dest
-            self.totals.setdefault(stat['dest_rse_id'], {}).setdefault(stat['src_rse_id'], self._FailureRateStat()).incorporate_stat(stat)
+            # store the failure rate statistics for a source node. we must aggregate the failure stats across all
+            # activity types and destinations
+            self.source_stats.setdefault(stat['src_rse_id'], self._FailureRateStat()).incorporate_stat(stat)
 
     def for_request(
             self,
@@ -1120,7 +1124,9 @@ class FailureRate(SourceRankingStrategy):
         failure_rate_for_rws = {}
 
         for src in rws.sources:
-            failure_rate_for_rws[src.rse.id] = self.totals.get(rws.dest_rse.id, {}).get(src.rse.id, self._FailureRateStat()).get_failure_rate()
+            failure_rate_for_rws[src.rse.id] = (
+                self.source_stats.get(rws.src.rse.id, self._FailureRateStat()).get_failure_rate()
+            )
 
         return FailureRate._RankingContext(self, rws, failure_rate_for_rws)
 
