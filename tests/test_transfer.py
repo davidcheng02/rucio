@@ -266,11 +266,11 @@ def test_failure_rate_with_custom_strategy(rse_factory, root_account, mock_scope
     # add mock data to TransferStats table
     db_session = get_session()
 
-    # ensure that the failure rate from src to dest is summed across all activities,
+    # ensure that the failure rate from src to dest is summed across all activities and destinations,
     low_failure_transfer_activity_1 = models.TransferStats(
         resolution=datetime.timedelta(minutes=5).toseconds(),
         timestamp=datetime.datetime.utcnow() - datetime.timedelta(minutes=30),
-        dest_rse_id=dst_rse_id,
+        dest_rse_id=high_failure_rse_id,
         src_rse_id=low_failure_rse_id,
         activity="test activity 1",
         files_done=2,
