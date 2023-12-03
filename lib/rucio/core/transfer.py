@@ -1069,6 +1069,8 @@ class PreferSingleHop(PathDistance):
         if not path:
             return SKIP_SOURCE
         return int(len(path) > 1)
+
+
 class FailureRate(SourceRankingStrategy):
     class _RankingContext(RequestRankingContext):
         def __init__(
@@ -1101,13 +1103,10 @@ class FailureRate(SourceRankingStrategy):
     def __init__(self, stats_manager: "request_core.TransferStatsManager", session: "Session"):
         super().__init__()
 
-        resolution = datetime.timedelta(hours=1)
         self.source_stats = {}
         for stat in stats_manager.load_totals(
-                resolution=resolution,
-                recent_t=datetime.datetime.utcnow(),
-                older_t=datetime.datetime.utcnow() - resolution,
-                session=session
+            datetime.datetime.utcnow() - datetime.timedelta(hours=1),
+            by_activity=False
         ):
             # store the failure rate statistics for a source node. we must aggregate the failure stats across all
             # activity types and destinations
@@ -1125,13 +1124,13 @@ class FailureRate(SourceRankingStrategy):
 
         for src in rws.sources:
             failure_rate_for_rws[src.rse.id] = (
-                self.source_stats.get(rws.src.rse.id, self._FailureRateStat()).get_failure_rate()
+                self.source_stats.get(src.rse.id, self._FailureRateStat()).get_failure_rate()
             )
 
         return FailureRate._RankingContext(self, rws, failure_rate_for_rws)
 
     def apply(self, ctx: RequestRankingContext, source: RequestSource) -> "Optional[int | _SkipSource]":
-        failure_rate = cast(FailureRate._RankingContext, ctx).failure_rate_for_rws.get(source.rse)
+        failure_rate = cast(FailureRate._RankingContext, ctx).failure_rate_for_rws.get(source.rse.id)
         return failure_rate
 
 class SkipSchemeMissmatch(PathDistance):

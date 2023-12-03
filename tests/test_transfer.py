@@ -268,7 +268,7 @@ def test_failure_rate_with_custom_strategy(rse_factory, root_account, mock_scope
 
     # ensure that the failure rate from src to dest is summed across all activities and destinations,
     low_failure_transfer_activity_1 = models.TransferStats(
-        resolution=datetime.timedelta(minutes=5).toseconds(),
+        resolution=datetime.timedelta(minutes=5).total_seconds(),
         timestamp=datetime.datetime.utcnow() - datetime.timedelta(minutes=30),
         dest_rse_id=high_failure_rse_id,
         src_rse_id=low_failure_rse_id,
@@ -278,7 +278,7 @@ def test_failure_rate_with_custom_strategy(rse_factory, root_account, mock_scope
         files_failed=0
     )
     low_failure_transfer_activity_2 = models.TransferStats(
-        resolution=datetime.timedelta(minutes=5).toseconds(),
+        resolution=datetime.timedelta(minutes=5).total_seconds(),
         timestamp=datetime.datetime.utcnow() - datetime.timedelta(minutes=30),
         dest_rse_id=dst_rse_id,
         src_rse_id=low_failure_rse_id,
@@ -288,7 +288,7 @@ def test_failure_rate_with_custom_strategy(rse_factory, root_account, mock_scope
         files_failed=1
     )
     high_failure_transfer_activity = models.TransferStats(
-        resolution=datetime.timedelta(minutes=5).toseconds(),
+        resolution=datetime.timedelta(minutes=5).total_seconds(),
         timestamp=datetime.datetime.utcnow() - datetime.timedelta(minutes=30),
         dest_rse_id=dst_rse_id,
         src_rse_id=high_failure_rse_id,
