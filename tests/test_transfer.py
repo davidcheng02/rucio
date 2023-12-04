@@ -248,6 +248,7 @@ def test_disk_vs_tape_with_custom_strategy(rse_factory, root_account, mock_scope
     else:
         assert transfer[0].src.rse.name == tape_rse_name
 
+
 @pytest.mark.parametrize("file_config_mock", [
     {"overrides": [('transfers', 'source_ranking_strategies', 'PathDistance')]},
     {"overrides": [('transfers', 'source_ranking_strategies', 'FailureRate,PathDistance')]}
@@ -266,7 +267,9 @@ def test_failure_rate_with_custom_strategy(rse_factory, root_account, mock_scope
     # add mock data to TransferStats table
     db_session = get_session()
 
-    # ensure that the failure rate from src to dest is summed across all activities and destinations,
+    # ensure that the failure rate for a source RSE is summed across all activities and destinations,
+    # low failure RSE has failure rate of 0.25
+    # high failure RSE has failure rate of 0.5
     low_failure_transfer_activity_1 = models.TransferStats(
         resolution=datetime.timedelta(minutes=5).total_seconds(),
         timestamp=datetime.datetime.utcnow() - datetime.timedelta(minutes=30),
@@ -322,6 +325,7 @@ def test_failure_rate_with_custom_strategy(rse_factory, root_account, mock_scope
         assert transfer[0].src.rse.name == low_failure_rse_name
     else:
         assert transfer[0].src.rse.name == high_failure_rse_name
+
 
 @pytest.mark.parametrize("caches_mock", [{"caches_to_mock": [
     'rucio.core.rse_expression_parser.REGION',  # The list of multihop RSEs is retrieved by an expression

@@ -1094,7 +1094,7 @@ class FailureRate(SourceRankingStrategy):
         def get_failure_rate(self) -> float:
             total_files = self.files_done + self.files_failed
 
-            # If no files have been sent yet, return failure rate as 0
+            # If no files have been sent yet, return failure rate as 0.0
             if total_files == 0:
                 return 0.0
 
@@ -1108,7 +1108,7 @@ class FailureRate(SourceRankingStrategy):
             datetime.datetime.utcnow() - datetime.timedelta(hours=1),
             by_activity=False
         ):
-            # store the failure rate statistics for a source node. we must aggregate the failure stats across all
+            # Store the failure rate statistics for a source node. we must aggregate the failure stats across all
             # activity types and destinations
             self.source_stats.setdefault(stat['src_rse_id'], self._FailureRateStat()).incorporate_stat(stat)
 
@@ -1132,6 +1132,7 @@ class FailureRate(SourceRankingStrategy):
     def apply(self, ctx: RequestRankingContext, source: RequestSource) -> "Optional[int | _SkipSource]":
         failure_rate = cast(FailureRate._RankingContext, ctx).failure_rate_for_rws.get(source.rse.id)
         return failure_rate
+
 
 class SkipSchemeMissmatch(PathDistance):
     filter_only = True
