@@ -1074,8 +1074,7 @@ class PreferSingleHop(PathDistance):
 class FailureRate(SourceRankingStrategy):
     """
     A source ranking strategy that ranks source nodes based on their failure rates for the past hour. Failure rate is
-    calculated by dividing the number of files that failed to transfer from the source node by the total number of files
-    transferred from the source node in the past hour.
+    calculated by dividing files failed by files attempted.
     """
     class _FailureRateStat:
         def __init__(self):
@@ -1087,28 +1086,26 @@ class FailureRate(SourceRankingStrategy):
             self.files_failed += stat['files_failed']
 
         def get_failure_rate(self) -> int:
-            total_files = self.files_done + self.files_failed
+            files_attempted = self.files_done + self.files_failed
 
-            # If no files have been sent yet, return failure rate as 0.0
-            if total_files == 0:
+            # If no files have been sent yet, return failure rate as 0
+            if files_attempted == 0:
                 return 0
 
-            return int ((self.files_failed / total_files) * 100)
+            return int((self.files_failed / files_attempted) * 10000)
 
-    def __init__(self, stats_manager: "request_core.TransferStatsManager", session: "Session"):
+    def __init__(self, stats_manager: "request_core.TransferStatsManager"):
         super().__init__()
-
         self.source_stats = {}
+
         for stat in stats_manager.load_totals(
             datetime.datetime.utcnow() - datetime.timedelta(hours=1),
             by_activity=False
         ):
-            # Store the failure rate statistics for a source node. we must aggregate the failure stats across all
-            # activity types and destinations
             self.source_stats.setdefault(stat['src_rse_id'], self._FailureRateStat()).incorporate_stat(stat)
 
     def apply(self, ctx: RequestRankingContext, source: RequestSource) -> "Optional[int | _SkipSource]":
-        failure_rate = cast(ctx.strategy, FailureRate).source_stats.get(source.rse.id).get_failure_rate()
+        failure_rate = cast(FailureRate, ctx.strategy).source_stats.get(source.rse.id).get_failure_rate()
         return failure_rate
 
 
@@ -1183,7 +1180,7 @@ def build_transfer_paths(
         PreferDiskOverTape.external_name: lambda: PreferDiskOverTape(),
         PathDistance.external_name: lambda: PathDistance(transfer_path_builder=transfer_path_builder),
         PreferSingleHop.external_name: lambda: PreferSingleHop(transfer_path_builder=transfer_path_builder),
-        FailureRate.external_name: lambda: FailureRate(stats_manager=stats_manager, session=session),
+        FailureRate.external_name: lambda: FailureRate(stats_manager=stats_manager),
     }
 
     default_strategies = [
