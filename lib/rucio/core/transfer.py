@@ -1062,7 +1062,6 @@ class PathDistance(SourceRankingStrategy):
             return SKIP_SOURCE
         return path[0].src.distance
 
-
 class PreferSingleHop(PathDistance):
     def apply(self, ctx: RequestRankingContext, source: RequestSource) -> "Optional[int | _SkipSource]":
         path = cast(PathDistance._RankingContext, ctx).paths_for_rws.get(source.rse)
@@ -1070,6 +1069,64 @@ class PreferSingleHop(PathDistance):
             return SKIP_SOURCE
         return int(len(path) > 1)
 
+class FailureRate(SourceRankingStrategy):
+    class _RankingContext(RequestRankingContext):
+        def __init__(self, strategy: "SourceRankingStrategy", rws: "RequestWithSources", failure_rate_for_rws: "Mapping[RseData, float]"):
+            super().__init__(strategy, rws)
+            self.failure_rate_for_rws = failure_rate_for_rws
+
+    class _FailureRateStat:
+        def __init__(self):
+            self.files_done = 0
+            self.files_failed = 0
+
+        def incorporate_stat(self, stat: "Mapping[str, str]") -> None:
+            self.files_done += stat['files_done']
+            self.files_failed += stat['files_failed']
+
+        def get_failure_rate(self) -> float:
+            total_files = self.files_done + self.files_failed
+
+            # If no files have been sent yet, return failure rate as 0
+            if total_files == 0:
+                return 0.0
+
+            return self.files_failed / total_files
+
+    def __init__(self, stats_manager: "request_core.TransferStatsManager", session: "Session"):
+        super().__init__()
+
+        resolution = datetime.timedelta(hours=1)
+        self.totals = {}
+        for stat in stats_manager.load_totals(
+            resolution=resolution,
+            recent_t=datetime.datetime.utcnow(),
+            older_t=datetime.datetime.utcnow() - resolution,
+            session=session
+        ):
+            # for each request's dest_rse, store the stats of the src_rse_id corresponding to this request totals will
+            # be a dict of dicts, where key is dest_rse, and value is a dict of (key: src_rse, value: _FailureRateStat)
+            # we must aggregate the failure stats across all activity types for a src and dest
+            self.totals.setdefault(stat['dest_rse_id'], {}).setdefault(stat['src_rse_id'], self._FailureRateStat()).incorporate_stat(stat)
+
+    def for_request(
+            self,
+            rws: RequestWithSources,
+            sources: "Iterable[RequestSource]",
+            *,
+            logger: "LoggerFunction" = logging.log,
+            session: "Session"
+    ) -> "RequestRankingContext":
+        failure_rate_for_rws = {}
+
+        for src in rws.sources:
+            failure_rate_for_rws[src.rse.id] = self.totals.get(rws.dest_rse.id, {}).get(src.rse.id, self._FailureRateStat()).get_failure_rate()
+
+        return FailureRate._RankingContext(self, rws, failure_rate_for_rws)
+
+    def apply(self, ctx: RequestRankingContext, source: RequestSource) -> "Optional[int | _SkipSource]":
+        failure_rate = cast(FailureRate._RankingContext, ctx).failure_rate_for_rws.get(source.rse)
+        return failure_rate
 
 class SkipSchemeMissmatch(PathDistance):
     filter_only = True
@@ -1128,6 +1185,8 @@ def build_transfer_paths(
         requested_source_only=requested_source_only,
     )
 
+    stats_manager = request_core.TransferStatsManager()
+
     available_strategies = {
         EnforceSourceRSEExpression.external_name: lambda: EnforceSourceRSEExpression(),
         SkipBlocklistedRSEs.external_name: lambda: SkipBlocklistedRSEs(topology=topology),
@@ -1140,6 +1199,7 @@ def build_transfer_paths(
         PreferDiskOverTape.external_name: lambda: PreferDiskOverTape(),
         PathDistance.external_name: lambda: PathDistance(transfer_path_builder=transfer_path_builder),
         PreferSingleHop.external_name: lambda: PreferSingleHop(transfer_path_builder=transfer_path_builder),
+        FailureRate.external_name: lambda: FailureRate(stats_manager=stats_manager, session=session),
     }
 
     default_strategies = [
@@ -1156,6 +1216,7 @@ def build_transfer_paths(
         PreferDiskOverTape.external_name,
         PathDistance.external_name,
         PreferSingleHop.external_name,
+        FailureRate.external_name,
     ]
     strategy_names = config_get_list('transfers', 'source_ranking_strategies', default=default_strategies)
 
