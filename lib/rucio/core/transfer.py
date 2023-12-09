@@ -16,6 +16,7 @@
 import datetime
 import logging
 import operator
+import random
 import re
 import sys
 import time
@@ -1062,6 +1063,113 @@ class PathDistance(SourceRankingStrategy):
             return SKIP_SOURCE
         return path[0].src.distance
 
+class TransferTime(SourceRankingStrategy):
+    """
+    A source ranking strategy that ranks source nodes based on the expected transfer time (including wait time in queue)
+    with exploration embedded through randomization.
+    """
+    # takes 10 s of overhead for any file transfer
+    FILE_OVERHEAD = 10
+    # assume 10 Mbps for sending bytes across a link
+    LINK_THROUGHPUT = (10 ** 7) / 8
+    # probability we choose any below-average transfer time source node
+    BELOW_AVG_EXPLORATION_FACTOR = 0.1
+
+    class _RankingContext(RequestRankingContext):
+        def __init__(
+            self,
+            strategy: "TransferTime",
+            rws: "RequestWithSources",
+            costs: "Mapping[RseData, int]"
+        ):
+            super().__init__(strategy, rws)
+            self.costs = costs
+
+    def for_request(
+        self,
+        rws: RequestWithSources,
+        sources: "Iterable[RequestSource]",
+        *,
+        logger: "LoggerFunction" = logging.log,
+        session: "Session"
+    ) -> "RequestRankingContext":
+        sources = list(sources)
+
+        transfer_time_by_rse = {}
+        total_transfer_time = 0
+
+        # store the files/bytes queued statistics for each source
+        for source in sources:
+            metrics = request_core.get_request_metrics(src_rse_id = source.rse.id, session=session)
+
+            src_files_queued = 0
+            src_bytes_queued = 0
+            for payload in metrics.values():
+                src_files_queued += payload['files']['queued-total']
+                src_bytes_queued += payload['bytes']['queued-total']
+
+            src_transfer_time = src_files_queued*self.FILE_OVERHEAD + src_bytes_queued*self.LINK_THROUGHPUT
+            transfer_time_by_rse[source.rse] = src_transfer_time
+            total_transfer_time += src_transfer_time
+
+        costs = defaultdict(lambda: 0)
+
+        if not total_transfer_time:
+            return TransferTime._RankingContext(self, rws, costs)
+
+        avg_transfer_time = total_transfer_time / len(sources)
+
+        # tally number of below avg nodes, and the total difference between each above-avg src transfer time and
+        # avg transfer time
+        below_avg_src_count = 0
+        above_avg_total_diff = 0
+        for transfer_time in transfer_time_by_rse.values():
+            if transfer_time > avg_transfer_time:
+                below_avg_src_count += 1
+            else:
+                above_avg_total_diff += (avg_transfer_time - transfer_time)
+
+        weights = []
+        sorted_src_rses = []
+
+        below_avg_prob = 1 - ((1 - self.BELOW_AVG_EXPLORATION_FACTOR)**(1/below_avg_src_count))
+        below_avg_counter = 0
+
+        # sort with fastest transfer time first
+        for src_rse, transfer_time in sorted(transfer_time_by_rse.items(), key= lambda item: item[1]):
+            sorted_src_rses.append(src_rse)
+
+            if transfer_time > avg_transfer_time:
+                weights.append(
+                    ((1 - below_avg_prob)**below_avg_counter)*below_avg_prob
+                )
+                below_avg_counter += 1
+            else:
+                transfer_time_diff = avg_transfer_time - transfer_time
+                weights.append(
+                    (transfer_time_diff / above_avg_total_diff)*(1 - self.BELOW_AVG_EXPLORATION_FACTOR)
+                )
+
+        rank = 0
+        # choose src nodes probabilistically (based on weights) without replacement to obtain ranking for each
+        # node as the cost
+        # TODO: should weights be adjusted after each iteration? i don't think so, because the weights are relative,
+        # so even if the sum of weights don't add up to 1 (which will happen after we remove the first weight),
+        # the relative proportion of the weights will be maintained, which is what we care about when choosing
+        # probabilistically
+        while len(sorted_src_rses) > 0:
+            chosen_rse = random.choices(population=sorted_src_rses, weights=weights, k=1)
+            costs[chosen_rse] = rank
+            rank += 1
+            chosen_rse_idx = sorted_src_rses.index(chosen_rse)
+            sorted_src_rses.pop(chosen_rse_idx)
+            weights.pop(chosen_rse_idx)
+
+        return TransferTime._RankingContext(self, rws, costs)
+
+    def apply(self, ctx: RequestRankingContext, source: RequestSource) -> "Optional[int | _SkipSource]":
+        ctx = cast(TransferTime._RankingContext, ctx)
+        return ctx.costs[source.rse]
 
 class PreferSingleHop(PathDistance):
     def apply(self, ctx: RequestRankingContext, source: RequestSource) -> "Optional[int | _SkipSource]":
