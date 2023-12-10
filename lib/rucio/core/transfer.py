@@ -1063,113 +1063,89 @@ class PathDistance(SourceRankingStrategy):
             return SKIP_SOURCE
         return path[0].src.distance
 
-class TransferTime(SourceRankingStrategy):
+
+class TransferWaitTime(SourceRankingStrategy):
     """
-    A source ranking strategy that ranks source nodes based on the expected transfer time (including wait time in queue)
-    with exploration embedded through randomization.
+    A source ranking strategy that ranks source nodes based on the expected wait time in queue with exploration embedded
+    through randomization. Note that smaller expected wait times are better.
     """
-    # takes 10 s of overhead for any file transfer
-    FILE_OVERHEAD = 10
-    # assume 10 Mbps for sending bytes across a link
-    LINK_THROUGHPUT = (10 ** 7) / 8
-    # probability we choose any below-average transfer time source node
-    BELOW_AVG_EXPLORATION_FACTOR = 0.1
+    # There is ~10 s of overhead for any file transfer
+    FILE_OVERHEAD_MS = 10000
+    # Assume 10 Mbps transfer speed
+    PER_BYTE_MS = 1000 / ((10 ** 7) / 8)
+    # Probability we choose an above-average transfer time source node
+    ABOVE_AVG_EXPLORATION = 0.1
 
     class _RankingContext(RequestRankingContext):
         def __init__(
-            self,
-            strategy: "TransferTime",
-            rws: "RequestWithSources",
-            costs: "Mapping[RseData, int]"
+                self,
+                strategy: "TransferWaitTime",
+                rws: "RequestWithSources",
+                costs: "Mapping[RseData, int]"
         ):
             super().__init__(strategy, rws)
             self.costs = costs
 
     def for_request(
-        self,
-        rws: RequestWithSources,
-        sources: "Iterable[RequestSource]",
-        *,
-        logger: "LoggerFunction" = logging.log,
-        session: "Session"
+            self,
+            rws: RequestWithSources,
+            sources: "Iterable[RequestSource]",
+            *,
+            logger: "LoggerFunction" = logging.log,
+            session: "Session"
     ) -> "RequestRankingContext":
         sources = list(sources)
 
-        transfer_time_by_rse = {}
-        total_transfer_time = 0
+        wait_by_rse = {}
 
-        # store the files/bytes queued statistics for each source
-        for source in sources:
-            metrics = request_core.get_request_metrics(src_rse_id = source.rse.id, session=session)
+        # For each source, estimate the average queue waiting time
+        for src in sources:
+            metrics = request_core.get_request_metrics(src_rse_id=src.rse.id, session=session)
 
             src_files_queued = 0
             src_bytes_queued = 0
             for payload in metrics.values():
-                src_files_queued += payload['files']['queued-total']
-                src_bytes_queued += payload['bytes']['queued-total']
+                src_files_queued += payload.get('files', {}).get('queued-total', 0)
+                src_bytes_queued += payload.get('bytes', {}).get('queued-total', 0)
 
-            src_transfer_time = src_files_queued*self.FILE_OVERHEAD + src_bytes_queued*self.LINK_THROUGHPUT
-            transfer_time_by_rse[source.rse] = src_transfer_time
-            total_transfer_time += src_transfer_time
+            src_wait = src_files_queued * self.FILE_OVERHEAD_MS + src_bytes_queued * self.PER_BYTE_MS
+            wait_by_rse[src.rse] = src_wait
 
         costs = defaultdict(lambda: 0)
+        total_wait = sum(wait_by_rse.values())
 
-        if not total_transfer_time:
-            return TransferTime._RankingContext(self, rws, costs)
+        # If all sources have no average queue waiting time, then all source choices are considered equal
+        if total_wait == 0:
+            return TransferWaitTime._RankingContext(self, rws, costs)
 
-        avg_transfer_time = total_transfer_time / len(sources)
+        explore_above_avg = random.random() < self.ABOVE_AVG_EXPLORATION
+        avg_wait = total_wait / len(sources)
+        # Add 1 so that max_wait - wait is never 0
+        max_wait = max(wait_by_rse.values()) + 1
 
-        # tally number of below avg nodes, and the total difference between each above-avg src transfer time and
-        # avg transfer time
-        below_avg_src_count = 0
-        above_avg_total_diff = 0
-        for transfer_time in transfer_time_by_rse.values():
-            if transfer_time > avg_transfer_time:
-                below_avg_src_count += 1
+        # Use the solution to the weighted random sampling (WRS) problem to rank above avg and below avg wait time
+        # sources amongst each other. Each source computes a weighted random key where larger keys are higher ranked.
+        # Reference: Weighted Random Sampling (2005; Efraimidis, Spirakis)
+        # https://utopia.duth.gr/%7Epefraimi/research/data/2007EncOfAlg.pdf
+        for src, wait in wait_by_rse.items():
+            # Smaller wait times are better so we normalize wait times by their difference with a larger value
+            if wait >= avg_wait:
+                weight = max_wait - wait
+                cost_basis = 2 if explore_above_avg else 0
             else:
-                above_avg_total_diff += (avg_transfer_time - transfer_time)
+                weight = avg_wait - wait
+                cost_basis = 1
 
-        weights = []
-        sorted_src_rses = []
+            # Keys typically have high floating precision and are guaranteed to be between 0 and 1
+            key = random.random() ** (1.0 / weight)
+            scale = 1 << 30
+            costs[src] = -round(cost_basis * scale + key * scale)
 
-        below_avg_prob = 1 - ((1 - self.BELOW_AVG_EXPLORATION_FACTOR)**(1/below_avg_src_count))
-        below_avg_counter = 0
-
-        # sort with fastest transfer time first
-        for src_rse, transfer_time in sorted(transfer_time_by_rse.items(), key= lambda item: item[1]):
-            sorted_src_rses.append(src_rse)
-
-            if transfer_time > avg_transfer_time:
-                weights.append(
-                    ((1 - below_avg_prob)**below_avg_counter)*below_avg_prob
-                )
-                below_avg_counter += 1
-            else:
-                transfer_time_diff = avg_transfer_time - transfer_time
-                weights.append(
-                    (transfer_time_diff / above_avg_total_diff)*(1 - self.BELOW_AVG_EXPLORATION_FACTOR)
-                )
-
-        rank = 0
-        # choose src nodes probabilistically (based on weights) without replacement to obtain ranking for each
-        # node as the cost
-        # TODO: should weights be adjusted after each iteration? i don't think so, because the weights are relative,
-        # so even if the sum of weights don't add up to 1 (which will happen after we remove the first weight),
-        # the relative proportion of the weights will be maintained, which is what we care about when choosing
-        # probabilistically
-        while len(sorted_src_rses) > 0:
-            chosen_rse = random.choices(population=sorted_src_rses, weights=weights, k=1)
-            costs[chosen_rse] = rank
-            rank += 1
-            chosen_rse_idx = sorted_src_rses.index(chosen_rse)
-            sorted_src_rses.pop(chosen_rse_idx)
-            weights.pop(chosen_rse_idx)
-
-        return TransferTime._RankingContext(self, rws, costs)
+        return TransferWaitTime._RankingContext(self, rws, costs)
 
     def apply(self, ctx: RequestRankingContext, source: RequestSource) -> "Optional[int | _SkipSource]":
-        ctx = cast(TransferTime._RankingContext, ctx)
-        return ctx.costs[source.rse]
+        return cast(TransferWaitTime._RankingContext, ctx).costs[source.rse]
+
 
 class PreferSingleHop(PathDistance):
     def apply(self, ctx: RequestRankingContext, source: RequestSource) -> "Optional[int | _SkipSource]":
@@ -1248,6 +1224,7 @@ def build_transfer_paths(
         PreferDiskOverTape.external_name: lambda: PreferDiskOverTape(),
         PathDistance.external_name: lambda: PathDistance(transfer_path_builder=transfer_path_builder),
         PreferSingleHop.external_name: lambda: PreferSingleHop(transfer_path_builder=transfer_path_builder),
+        TransferWaitTime.external_name: lambda: TransferWaitTime(),
     }
 
     default_strategies = [
@@ -1264,6 +1241,7 @@ def build_transfer_paths(
         PreferDiskOverTape.external_name,
         PathDistance.external_name,
         PreferSingleHop.external_name,
+        TransferWaitTime.external_name,
     ]
     strategy_names = config_get_list('transfers', 'source_ranking_strategies', default=default_strategies)
 

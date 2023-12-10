@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import pytest
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 from rucio.common.exception import NoDistance
@@ -25,6 +26,7 @@ from rucio.core.topology import get_hops, Topology
 from rucio.core import rule as rule_core
 from rucio.core import request as request_core
 from rucio.core import rse as rse_core
+from rucio.db.sqla import models
 from rucio.db.sqla.constants import RSEType, RequestState
 from rucio.db.sqla.session import get_session
 from rucio.common.utils import generate_uuid
@@ -245,6 +247,76 @@ def test_disk_vs_tape_with_custom_strategy(rse_factory, root_account, mock_scope
         assert transfer[0].src.rse.name == disk_rse_name
     else:
         assert transfer[0].src.rse.name == tape_rse_name
+
+
+@pytest.mark.parametrize("file_config_mock", [
+    {"overrides": [('transfers', 'source_ranking_strategies', 'PathDistance')]},
+    {"overrides": [('transfers', 'source_ranking_strategies', 'TransferWaitTime,PathDistance')]}
+], indirect=True)
+def test_wait_time_with_custom_strategy(rse_factory, root_account, mock_scope, file_config_mock):
+    """
+    Sources that have shorter wait times are more likely to be picked if the TransferWaitTime strategy is set.
+    """
+    short_wait_rse_name, short_wait_rse_id = rse_factory.make_posix_rse()
+    long_wait_rse_name, long_wait_rse_id = rse_factory.make_posix_rse()
+    dst_rse_name, dst_rse_id = rse_factory.make_posix_rse()
+    all_rses = [long_wait_rse_id, short_wait_rse_id, dst_rse_id]
+    add_distance(short_wait_rse_id, dst_rse_id, distance=20)
+    add_distance(long_wait_rse_id, dst_rse_id, distance=10)
+
+    # Add mock data about existing source queues
+    db_session = get_session()
+
+    def _add_mock_queued_request(src_rse_id: str, bytes: int):
+        request = models.Request(
+            dest_rse_id=dst_rse_id,
+            source_rse_id=src_rse_id,
+            state=RequestState.QUEUED,
+            bytes=bytes
+        )
+        request.save(session=db_session)
+        db_session.commit()
+        db_session.expunge(request)
+
+    # short_wait_rse has expected wait time of 1 * 10 + 1 = 11 seconds
+    # long_wait_rse has expected wait time of 2 * 10 + 6 = 26 seconds
+    # Average wait time is 18.5 seconds
+    _add_mock_queued_request(short_wait_rse_id, (10 ** 7) / 8)      # 10 megabits
+    _add_mock_queued_request(long_wait_rse_id, 2 * (10 ** 7) / 8)   # 20 megabits
+    _add_mock_queued_request(long_wait_rse_id, 4 * (10 ** 7) / 8)   # 40 megabits
+
+    # Since TransferWaitTime is randomized, we need to simulate lots of requests
+    using_transfer_wait_time = 'TransferWaitTime' in file_config_mock.get('transfers', 'source_ranking_strategies')
+    new_requests = 100 if using_transfer_wait_time else 1
+
+    files = [{'scope': mock_scope, 'name': 'lfn.' + generate_uuid(), 'type': 'FILE', 'bytes': 1, 'adler32': 'beefdead'} for _ in range(new_requests)]
+    dids = [{'scope': file['scope'], 'name': file['name']} for file in files]
+    for rse_id in [long_wait_rse_id, short_wait_rse_id]:
+        add_replicas(rse_id=rse_id, files=files, account=root_account)
+
+    rule_core.add_rule(dids=dids, account=root_account, copies=1, rse_expression=dst_rse_name, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
+    topology = Topology().configure_multihop()
+    requests = list_and_mark_transfer_requests_and_source_replicas(rse_collection=topology, rses=all_rses)
+    [[_, transfers]] = pick_and_prepare_submission_path(topology=topology, protocol_factory=ProtocolFactory(),
+                                                        requests_with_sources=requests).items()
+
+    if using_transfer_wait_time:
+        picks_by_rse_name = defaultdict(lambda: 0)
+
+        for transfer in transfers:
+            picks_by_rse_name[transfer[0].src.rse.name] += 1
+
+        print("long_wait_rse was picked {} times, short_wait_rse was picked {} times".format(picks_by_rse_name[long_wait_rse_name], picks_by_rse_name[short_wait_rse_name]))
+
+        # long_wait_rse is above average so should only be picked ~10% of the time
+        # short_wait_rse should be picked ~90% of the time
+        # Standard deviation of binomial distribution is sqrt(new_requests * .1 * .9)
+        # 99.7% confidence interval is +- 3 standard deviation
+        stdev = (new_requests * .1 * .9) ** 0.5
+        assert .1 * new_requests - 3 * stdev <= picks_by_rse_name[long_wait_rse_name] <= .1 * new_requests + 3 * stdev
+        assert .9 * new_requests - 3 * stdev <= picks_by_rse_name[short_wait_rse_name] <= .9 * new_requests + 3 * stdev
+    else:
+        assert transfers[0][0].src.rse.name == long_wait_rse_name
 
 
 @pytest.mark.parametrize("caches_mock", [{"caches_to_mock": [
