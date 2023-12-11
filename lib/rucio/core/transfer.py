@@ -1082,7 +1082,7 @@ class TransferWaitTime(SourceRankingStrategy):
                 strategy: "TransferWaitTime",
                 rws: "RequestWithSources",
                 costs: "Mapping[RseData, int]"
-        ):
+        ) -> None:
             super().__init__(strategy, rws)
             self.costs = costs
 
@@ -1094,22 +1094,19 @@ class TransferWaitTime(SourceRankingStrategy):
             logger: "LoggerFunction" = logging.log,
             session: "Session"
     ) -> "RequestRankingContext":
-        sources = list(sources)
-
         wait_by_rse = {}
 
         # For each source, estimate the average queue waiting time
         for src in sources:
-            metrics = request_core.get_request_metrics(src_rse_id=src.rse.id, session=session)
-
             src_files_queued = 0
             src_bytes_queued = 0
+            metrics = request_core.get_request_metrics(src_rse_id=src.rse.id, session=session)
+
             for payload in metrics.values():
                 src_files_queued += payload.get('files', {}).get('queued-total', 0)
                 src_bytes_queued += payload.get('bytes', {}).get('queued-total', 0)
 
-            src_wait = src_files_queued * self.FILE_OVERHEAD_MS + src_bytes_queued * self.PER_BYTE_MS
-            wait_by_rse[src.rse] = src_wait
+            wait_by_rse[src.rse] = src_files_queued * self.FILE_OVERHEAD_MS + src_bytes_queued * self.PER_BYTE_MS
 
         costs = defaultdict(lambda: 0)
         total_wait = sum(wait_by_rse.values())
@@ -1119,26 +1116,29 @@ class TransferWaitTime(SourceRankingStrategy):
             return TransferWaitTime._RankingContext(self, rws, costs)
 
         explore_above_avg = random.random() < self.ABOVE_AVG_EXPLORATION
-        avg_wait = total_wait / len(sources)
-        # Add 1 so that max_wait - wait is never 0
-        max_wait = max(wait_by_rse.values()) + 1
 
         # Use the solution to the weighted random sampling (WRS) problem to rank above avg and below avg wait time
         # sources amongst each other. Each source computes a weighted random key where larger keys are higher ranked.
+        # Smaller wait times are better so we calculate weight by normalizing wait and then subtracting from 1
         # Reference: Weighted Random Sampling (2005; Efraimidis, Spirakis)
         # https://utopia.duth.gr/%7Epefraimi/research/data/2007EncOfAlg.pdf
+        avg_wait = total_wait / len(sources)
+        above_avg_total_wait = sum([wait for wait in wait_by_rse.values() if wait >= avg_wait])
+        below_avg_total_wait = sum([wait for wait in wait_by_rse.values() if wait < avg_wait])
+
         for src, wait in wait_by_rse.items():
-            # Smaller wait times are better so we normalize wait times by their difference with a larger value
             if wait >= avg_wait:
-                weight = max_wait - wait
+                norm_wait = above_avg_total_wait
                 cost_basis = 2 if explore_above_avg else 0
             else:
-                weight = avg_wait - wait
+                norm_wait = below_avg_total_wait
                 cost_basis = 1
 
-            # Keys typically have high floating precision and are guaranteed to be between 0 and 1
+            # ensure weight is not 0
+            weight = max(1 - wait / norm_wait, 10 ** -9)
             key = random.random() ** (1.0 / weight)
             scale = 1 << 30
+            # Keys typically have high floating precision and are guaranteed to be between 0 and 1
             costs[src] = -round(cost_basis * scale + key * scale)
 
         return TransferWaitTime._RankingContext(self, rws, costs)

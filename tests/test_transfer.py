@@ -257,12 +257,16 @@ def test_wait_time_with_custom_strategy(rse_factory, root_account, mock_scope, f
     """
     Sources that have shorter wait times are more likely to be picked if the TransferWaitTime strategy is set.
     """
+    shortest_wait_rse_name, shortest_wait_rse_id = rse_factory.make_posix_rse()
     short_wait_rse_name, short_wait_rse_id = rse_factory.make_posix_rse()
     long_wait_rse_name, long_wait_rse_id = rse_factory.make_posix_rse()
+    longest_wait_rse_name, longest_wait_rse_id = rse_factory.make_posix_rse()
     dst_rse_name, dst_rse_id = rse_factory.make_posix_rse()
-    all_rses = [long_wait_rse_id, short_wait_rse_id, dst_rse_id]
-    add_distance(short_wait_rse_id, dst_rse_id, distance=20)
-    add_distance(long_wait_rse_id, dst_rse_id, distance=10)
+    all_rses = [shortest_wait_rse_id, short_wait_rse_id, long_wait_rse_id, longest_wait_rse_id, dst_rse_id]
+    add_distance(shortest_wait_rse_id, dst_rse_id, distance=40)
+    add_distance(short_wait_rse_id, dst_rse_id, distance=30)
+    add_distance(long_wait_rse_id, dst_rse_id, distance=20)
+    add_distance(longest_wait_rse_id, dst_rse_id, distance=10)
 
     # Add mock data about existing source queues
     db_session = get_session()
@@ -278,20 +282,37 @@ def test_wait_time_with_custom_strategy(rse_factory, root_account, mock_scope, f
         db_session.commit()
         db_session.expunge(request)
 
-    # short_wait_rse has expected wait time of 1 * 10 + 1 = 11 seconds
-    # long_wait_rse has expected wait time of 2 * 10 + 6 = 26 seconds
-    # Average wait time is 18.5 seconds
-    _add_mock_queued_request(short_wait_rse_id, (10 ** 7) / 8)      # 10 megabits
-    _add_mock_queued_request(long_wait_rse_id, 2 * (10 ** 7) / 8)   # 20 megabits
-    _add_mock_queued_request(long_wait_rse_id, 4 * (10 ** 7) / 8)   # 40 megabits
+    # Expected wait times
+    # shortest_wait_rse     1 * 10 + 10 = 20 seconds
+    # short_wait_rse        2 * 10 + 20 = 40 seconds
+    # long_wait_rse         1 * 10 + 50 = 60 seconds
+    # longest_wait_rse      3 * 10 + 90 = 120 seconds
+    bytes_per_sec = (10 ** 7) / 8
+    _add_mock_queued_request(shortest_wait_rse_id, 10 * bytes_per_sec)
+    _add_mock_queued_request(short_wait_rse_id, 10 * bytes_per_sec)
+    _add_mock_queued_request(short_wait_rse_id, 10 * bytes_per_sec)
+    _add_mock_queued_request(long_wait_rse_id, 50 * bytes_per_sec)
+    _add_mock_queued_request(longest_wait_rse_id, 15 * bytes_per_sec)
+    _add_mock_queued_request(longest_wait_rse_id, 30 * bytes_per_sec)
+    _add_mock_queued_request(longest_wait_rse_id, 45 * bytes_per_sec)
+
+    # Below average wait sources should be picked ~90% of the time, above average wait sources ~10% of the time
+    # shortest_wait_rse and short_wait_rse should proportionally be picked 60% and 30% of the time
+    # long_wait_rse and longest_wait_rse should proportionally be picked 6.67% and 3.33% of the time
+    expected_prob_by_rse_name = {
+        shortest_wait_rse_name: .6,
+        short_wait_rse_name: .3,
+        long_wait_rse_name: .0667,
+        longest_wait_rse_name: .0333
+    }
 
     # Since TransferWaitTime is randomized, we need to simulate lots of requests
     using_transfer_wait_time = 'TransferWaitTime' in file_config_mock.get('transfers', 'source_ranking_strategies')
-    new_requests = 100 if using_transfer_wait_time else 1
+    num_requests = 100 if using_transfer_wait_time else 1
 
-    files = [{'scope': mock_scope, 'name': 'lfn.' + generate_uuid(), 'type': 'FILE', 'bytes': 1, 'adler32': 'beefdead'} for _ in range(new_requests)]
+    files = [{'scope': mock_scope, 'name': 'lfn.' + generate_uuid(), 'type': 'FILE', 'bytes': 1, 'adler32': 'beefdead'} for _ in range(num_requests)]
     dids = [{'scope': file['scope'], 'name': file['name']} for file in files]
-    for rse_id in [long_wait_rse_id, short_wait_rse_id]:
+    for rse_id in [shortest_wait_rse_id, short_wait_rse_id, long_wait_rse_id, longest_wait_rse_id]:
         add_replicas(rse_id=rse_id, files=files, account=root_account)
 
     rule_core.add_rule(dids=dids, account=root_account, copies=1, rse_expression=dst_rse_name, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
@@ -302,21 +323,22 @@ def test_wait_time_with_custom_strategy(rse_factory, root_account, mock_scope, f
 
     if using_transfer_wait_time:
         picks_by_rse_name = defaultdict(lambda: 0)
-
         for transfer in transfers:
             picks_by_rse_name[transfer[0].src.rse.name] += 1
 
-        print("long_wait_rse was picked {} times, short_wait_rse was picked {} times".format(picks_by_rse_name[long_wait_rse_name], picks_by_rse_name[short_wait_rse_name]))
+        print("shortest_wait_rse_picks =", picks_by_rse_name[shortest_wait_rse_name])
+        print("short_wait_rse_picks =", picks_by_rse_name[short_wait_rse_name])
+        print("long_wait_rse_picks =", picks_by_rse_name[long_wait_rse_name])
+        print("longest_wait_rse_picks =", picks_by_rse_name[longest_wait_rse_name])
 
-        # long_wait_rse is above average so should only be picked ~10% of the time
-        # short_wait_rse should be picked ~90% of the time
-        # Standard deviation of binomial distribution is sqrt(new_requests * .1 * .9)
-        # 99.7% confidence interval is +- 3 standard deviation
-        stdev = (new_requests * .1 * .9) ** 0.5
-        assert .1 * new_requests - 3 * stdev <= picks_by_rse_name[long_wait_rse_name] <= .1 * new_requests + 3 * stdev
-        assert .9 * new_requests - 3 * stdev <= picks_by_rse_name[short_wait_rse_name] <= .9 * new_requests + 3 * stdev
+        # We can model probability of picking a source using a binomial distribution.
+        # Standard deviation is sqrt(num_requests * .1 * .9). +- 3 standard deviation is 99.7% confidence interval
+        stdev = (num_requests * .1 * .9) ** 0.5
+        for rse_name, expected_prob in expected_prob_by_rse_name.items():
+            expected_picks = expected_prob * num_requests
+            assert expected_picks - 3 * stdev <= picks_by_rse_name[rse_name] <= expected_picks + 3 * stdev
     else:
-        assert transfers[0][0].src.rse.name == long_wait_rse_name
+        assert transfers[0][0].src.rse.name == longest_wait_rse_name
 
 
 @pytest.mark.parametrize("caches_mock", [{"caches_to_mock": [
