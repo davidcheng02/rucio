@@ -297,13 +297,13 @@ def test_wait_time_with_custom_strategy(rse_factory, root_account, mock_scope, f
     _add_mock_queued_request(longest_wait_rse_id, 45 * bytes_per_sec)
 
     # Below average wait sources should be picked ~90% of the time, above average wait sources ~10% of the time
-    # shortest_wait_rse and short_wait_rse should proportionally be picked 60% and 30% of the time
-    # long_wait_rse and longest_wait_rse should proportionally be picked 6.67% and 3.33% of the time
+    # In their group, sources should be picked proportionally based on wait time (with shorter wait timers preferred)
+    above_average_exploration = .1
     expected_prob_by_rse_name = {
-        shortest_wait_rse_name: .6,
-        short_wait_rse_name: .3,
-        long_wait_rse_name: .0667,
-        longest_wait_rse_name: .0333
+        shortest_wait_rse_name: (1 - above_average_exploration) * 2 / 3,
+        short_wait_rse_name: (1 - above_average_exploration) / 3,
+        long_wait_rse_name: above_average_exploration * 2 / 3,
+        longest_wait_rse_name: above_average_exploration / 3
     }
 
     # Since TransferWaitTime is randomized, we need to simulate lots of requests

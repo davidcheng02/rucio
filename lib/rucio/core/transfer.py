@@ -1115,8 +1115,6 @@ class TransferWaitTime(SourceRankingStrategy):
         if total_wait == 0:
             return TransferWaitTime._RankingContext(self, rws, costs)
 
-        explore_above_avg = random.random() < self.ABOVE_AVG_EXPLORATION
-
         # Use the solution to the weighted random sampling (WRS) problem to rank above avg and below avg wait time
         # sources amongst each other. Each source computes a weighted random key where larger keys are higher ranked.
         # Smaller wait times are better so we calculate weight by normalizing wait and then subtracting from 1
@@ -1129,17 +1127,18 @@ class TransferWaitTime(SourceRankingStrategy):
         for src, wait in wait_by_rse.items():
             if wait >= avg_wait:
                 norm_wait = above_avg_total_wait
-                cost_basis = 2 if explore_above_avg else 0
+                exploration = self.ABOVE_AVG_EXPLORATION
             else:
                 norm_wait = below_avg_total_wait
-                cost_basis = 1
+                exploration = 1 - self.ABOVE_AVG_EXPLORATION
 
+            weight = exploration * (1 - wait / norm_wait)
             # ensure weight is not 0
-            weight = max(1 - wait / norm_wait, 10 ** -9)
+            weight = max(weight, 10 ** -9)
             key = random.random() ** (1.0 / weight)
             scale = 1 << 30
             # Keys typically have high floating precision and are guaranteed to be between 0 and 1
-            costs[src] = -round(cost_basis * scale + key * scale)
+            costs[src] = -round(key * scale)
 
         return TransferWaitTime._RankingContext(self, rws, costs)
 
@@ -1241,7 +1240,6 @@ def build_transfer_paths(
         PreferDiskOverTape.external_name,
         PathDistance.external_name,
         PreferSingleHop.external_name,
-        TransferWaitTime.external_name,
     ]
     strategy_names = config_get_list('transfers', 'source_ranking_strategies', default=default_strategies)
 
