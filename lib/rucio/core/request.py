@@ -1342,6 +1342,10 @@ class TransferStatsManager:
         self.downsample_timer = None
         self.downsample_period = math.ceil(raw_retention.total_seconds())
 
+        self.transfers_done = 0
+        self.avg_wait_time = 0
+        self.avg_wait_time_start_timestamp = self.current_timestamp
+
     def __enter__(self):
         self.record_stats = config_get_bool('transfers', 'stats_enabled', default=self.record_stats)
         downsample_period = config_get_int('transfers', 'stats_downsample_period', default=self.downsample_period)
@@ -1371,6 +1375,8 @@ class TransferStatsManager:
             state: RequestState,
             file_size: int,
             *,
+            submitted_at: datetime.datetime = None,
+            started_at: datetime.datetime = None,
             session: "Optional[Session]" = None
     ) -> None:
         """
@@ -1390,6 +1396,20 @@ class TransferStatsManager:
                 if state == RequestState.DONE:
                     record.files_done += 1
                     record.bytes_done += file_size
+
+                    if submitted_at is not None and started_at is not None:
+                        wait_time = (started_at - submitted_at).total_seconds()
+
+                        # avg_wait_time averages across a tumbling window, so reset avg every few hours
+                        hours_window = 6
+                        if self.avg_wait_time_start_timestamp < (now - datetime.timedelta(hours=hours_window)):
+                            self.avg_wait_time = 0
+                            self.transfers_done = 0
+                            self.avg_wait_time_start_timestamp = now
+
+                        self.avg_wait_time = ((self.avg_wait_time * self.transfers_done) + wait_time) / (self.transfers_done + 1)
+                        self.transfers_done += 1
+                        METRICS.gauge('avg_wait_time').set(self.avg_wait_time)
                 else:
                     record.files_failed += 1
         if save_samples:
