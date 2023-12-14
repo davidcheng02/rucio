@@ -1100,27 +1100,31 @@ class TransferWaitTime(SourceRankingStrategy):
         for src in sources:
             src_files_queued = 0
             src_bytes_queued = 0
-            metrics = request_core.get_request_metrics(src_rse_id=src.rse.id, session=session)
 
-            for payload in metrics.values():
-                src_files_queued += payload.get('files', {}).get('queued-total', 0)
-                src_bytes_queued += payload.get('bytes', {}).get('queued-total', 0)
+            src_stats = request_core.get_request_stats(
+                state=RequestState.QUEUED,
+                src_rse_id=src.rse.id,
+                session=session
+            )
+            for stat in src_stats:
+                src_files_queued += stat.counter
+                src_bytes_queued += stat.bytes
 
             wait_by_rse[src.rse] = src_files_queued * self.FILE_OVERHEAD_MS + src_bytes_queued * self.PER_BYTE_MS
 
-        costs = defaultdict(lambda: 0)
+        costs = defaultdict(int)
         total_wait = sum(wait_by_rse.values())
 
         # If all sources have no average queue waiting time, then all source choices are considered equal
         if total_wait == 0:
             return TransferWaitTime._RankingContext(self, rws, costs)
 
-        # Use the solution to the weighted random sampling (WRS) problem to rank above avg and below avg wait time
-        # sources amongst each other. Each source computes a weighted random key where larger keys are higher ranked.
-        # Smaller wait times are better so we calculate weight by normalizing wait and then subtracting from 1
+        # Use the solution to the weighted random sampling (WRS) problem to rank sources among each other. Each source
+        # computes a weighted random key where larger keys are higher ranked. Smaller wait times are better so we
+        # calculate weight by normalizing wait and then subtracting from 1. We weight above average and below average
+        # wait time sources differently.
         # Reference: Weighted Random Sampling (2005; Efraimidis, Spirakis)
-        # https://utopia.duth.gr/%7Epefraimi/research/data/2007EncOfAlg.pdf
-        avg_wait = total_wait / len(sources)
+        avg_wait = total_wait / len(wait_by_rse)
         above_avg_total_wait = sum([wait for wait in wait_by_rse.values() if wait >= avg_wait])
         below_avg_total_wait = sum([wait for wait in wait_by_rse.values() if wait < avg_wait])
 
@@ -1133,7 +1137,7 @@ class TransferWaitTime(SourceRankingStrategy):
                 exploration = 1 - self.ABOVE_AVG_EXPLORATION
 
             weight = exploration * (1 - wait / norm_wait)
-            # ensure weight is not 0
+            # Ensure weight is not 0
             weight = max(weight, 10 ** -9)
             key = random.random() ** (1.0 / weight)
             scale = 1 << 30

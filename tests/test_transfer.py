@@ -28,7 +28,7 @@ from rucio.core import request as request_core
 from rucio.core import rse as rse_core
 from rucio.db.sqla import models
 from rucio.db.sqla.constants import RSEType, RequestState
-from rucio.db.sqla.session import get_session
+from rucio.db.sqla.session import get_session, transactional_session
 from rucio.common.utils import generate_uuid
 from rucio.daemons.conveyor.common import assign_paths_to_transfertool_and_create_hops, pick_and_prepare_submission_path
 
@@ -256,6 +256,7 @@ def test_disk_vs_tape_with_custom_strategy(rse_factory, root_account, mock_scope
 def test_wait_time_with_custom_strategy(rse_factory, root_account, mock_scope, file_config_mock):
     """
     Sources that have shorter wait times are more likely to be picked if the TransferWaitTime strategy is set.
+    This test is randomized and has a small probability of failing (~1/15625). In the unlikely event of failure, rerun.
     """
     shortest_wait_rse_name, shortest_wait_rse_id = rse_factory.make_posix_rse()
     short_wait_rse_name, short_wait_rse_id = rse_factory.make_posix_rse()
@@ -268,20 +269,18 @@ def test_wait_time_with_custom_strategy(rse_factory, root_account, mock_scope, f
     add_distance(long_wait_rse_id, dst_rse_id, distance=20)
     add_distance(longest_wait_rse_id, dst_rse_id, distance=10)
 
-    # Add mock data about existing source queues
-    db_session = get_session()
-
-    def _add_mock_queued_request(src_rse_id: str, bytes: int):
+    @transactional_session
+    def _add_mock_queued_request(src_rse_id: str, bytes: int, *, session=None):
         request = models.Request(
             dest_rse_id=dst_rse_id,
             source_rse_id=src_rse_id,
             state=RequestState.QUEUED,
             bytes=bytes
         )
-        request.save(session=db_session)
-        db_session.commit()
-        db_session.expunge(request)
+        request.save(session=session)
+        session.expunge(request)
 
+    # Add mock data about existing source queues
     # Expected wait times
     # shortest_wait_rse     1 * 10 + 10 = 20 seconds
     # short_wait_rse        2 * 10 + 20 = 40 seconds
@@ -331,12 +330,12 @@ def test_wait_time_with_custom_strategy(rse_factory, root_account, mock_scope, f
         print("long_wait_rse_picks =", picks_by_rse_name[long_wait_rse_name])
         print("longest_wait_rse_picks =", picks_by_rse_name[longest_wait_rse_name])
 
-        # We can model probability of picking a source using a binomial distribution.
-        # Standard deviation is sqrt(num_requests * .1 * .9). +- 3 standard deviation is 99.7% confidence interval
+        # We can model probability of picking a source using a binomial distribution
+        # Standard deviation is sqrt(num_requests * .1 * .9). +- 4 standard deviation is 99.9936% confidence interval
         stdev = (num_requests * .1 * .9) ** 0.5
         for rse_name, expected_prob in expected_prob_by_rse_name.items():
             expected_picks = expected_prob * num_requests
-            assert expected_picks - 3 * stdev <= picks_by_rse_name[rse_name] <= expected_picks + 3 * stdev
+            assert expected_picks - 4 * stdev <= picks_by_rse_name[rse_name] <= expected_picks + 4 * stdev
     else:
         assert transfers[0][0].src.rse.name == longest_wait_rse_name
 
