@@ -417,6 +417,74 @@ def test_wait_time_with_custom_strategy(rse_factory, root_account, mock_scope, f
     else:
         assert transfers[0][0].src.rse.name == longest_wait_rse_name
 
+DEFAULT_STRATEGIES = 'EnforceSourceRSEExpression,SkipBlocklistedRSEs,SkipRestrictedRSEs,EnforceStagingBuffer,RestrictTapeSources,SkipSchemeMissmatch,SkipIntermediateTape,HighestAdjustedRankingFirst,PreferDiskOverTape,PathDistance,PreferSingleHop'
+
+@pytest.mark.parametrize("file_config_mock", [
+    {"overrides": [('transfers', 'source_ranking_strategies', DEFAULT_STRATEGIES)]},
+    {"overrides": [('transfers', 'source_ranking_strategies', 'TransferWaitTime')]}
+], indirect=True)
+def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config_mock):
+    """
+    Run simulations to test effectiveness of TransferWaitTime strategy
+    """
+    # TODO: import threading, time, math
+
+    # How much faster our simulation is relative to real time
+    SPEEDUP = 60
+
+    # TODO: get accurate value
+    ARRIVALS_PER_SEC = -1
+
+    # In units of real time
+    SIMULATED_SECONDS = 3600 # 1 hours
+
+    # TODO: Mock a topology
+
+    end_time = datetime.datetime.now() + datetime.timedelta(seconds=SIMULATED_SECONDS / SPEEDUP)
+
+    @transactional_session
+    def _generate_requests(*, session=None):
+        """
+        Generate requests following a Poisson distribution
+        """
+        while datetime.datetime.now() < end_time:
+            # Interarrival time of Poisson is exponential
+            # We can generate uniform random and invert the CDF of exponential to generate this
+            interarrival_time = -1 / arrivals_per_sec * math.log(1 - u)
+            time.sleep(interarrival_time / SPEEDUP)
+
+            # TODO: Pick destination source weighted randomly (dests should be picked with different priorities
+            dest_rse_id = None
+
+            # TODO: Create a rule that will result in new requests
+
+    @transaction_session
+    def _do_transfers(*, session=None):
+        """
+        Does the transfers
+        For each source nodes, it needs to simulate a queue for transfers. It should not sleep like the request
+        creator thread but based on timestamp of queued requests, it can simulate how long it would wait until
+        it executes by randomly generating how long it would take to send the file. The wait time is what we
+        should save and compare
+
+        It should be ~10 s per file and 10Mbps with some random noise
+        """
+        while datetime.now() < end_time:
+            # TODO
+            pass
+
+    # Create threads to mock daemons
+    request_creator = threading.Thread(target=_generate_requests)
+    request_creator.start()
+
+    # TODO: use a preparer daemon that will choose source nodes (see test_conveyor.py)
+    # TODO: we may have to put this test in test_conveyor.py or test_preparer.py
+
+    mock_transfer_thread = threading.Thread(target=_do_transfers)
+    mock_transfer_thread.start()
+
+    request_creator.join()
+    mock_transfer_thread.join()
 
 @pytest.mark.parametrize("caches_mock", [{"caches_to_mock": [
     'rucio.core.rse_expression_parser.REGION',  # The list of multihop RSEs is retrieved by an expression
