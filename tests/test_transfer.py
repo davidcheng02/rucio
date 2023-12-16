@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import random
 
 import pytest
 from collections import defaultdict
@@ -32,6 +33,7 @@ from rucio.db.sqla.constants import RSEType, RequestState
 from rucio.db.sqla.session import get_session, transactional_session
 from rucio.common.utils import generate_uuid
 from rucio.daemons.conveyor.common import assign_paths_to_transfertool_and_create_hops, pick_and_prepare_submission_path
+from rucio.daemons.conveyor.preparer import preparer
 
 
 def _prepare_submission(rses):
@@ -428,6 +430,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     Run simulations to test effectiveness of TransferWaitTime strategy
     """
     # TODO: import threading, time, math
+    import threading, time, math
 
     # How much faster our simulation is relative to real time
     SPEEDUP = 60
@@ -438,27 +441,75 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     # In units of real time
     SIMULATED_SECONDS = 3600 # 1 hours
 
-    # TODO: Mock a topology
+    # no topology yet, just creating rses
+    rse0, rse0_id = rse_factory.make_mock_rse()
+    rse1, rse1_id = rse_factory.make_mock_rse()
+    rse2, rse2_id = rse_factory.make_mock_rse()
+    rse3, rse3_id = rse_factory.make_mock_rse()
+    rse4, rse4_id = rse_factory.make_mock_rse()
+    rse5, rse5_id = rse_factory.make_mock_rse()
+    rse6, rse6_id = rse_factory.make_mock_rse()
+
+    all_rse_ids = [rse0_id, rse1_id, rse2_id, rse3_id, rse4_id, rse5_id, rse6_id]
+    all_rses = [rse0, rse1, rse2, rse3, rse4, rse5, rse6]
+    rse_weights = [random.random() for _ in range(len(all_rses))]
+
+    topology = Topology().configure_multihop()
 
     end_time = datetime.datetime.now() + datetime.timedelta(seconds=SIMULATED_SECONDS / SPEEDUP)
 
     @transactional_session
     def _generate_requests(*, session=None):
+
+        def _add_mock_queued_request(src_rse_id: str, dst_rse_id: str, bytes: int, *, session=None):
+            request = models.Request(
+                dest_rse_id=dst_rse_id,
+                source_rse_id=src_rse_id,
+                state=RequestState.QUEUED,
+                bytes=bytes
+            )
+            request.save(session=session)
+            session.expunge(request)
         """
         Generate requests following a Poisson distribution
         """
         while datetime.datetime.now() < end_time:
             # Interarrival time of Poisson is exponential
             # We can generate uniform random and invert the CDF of exponential to generate this
-            interarrival_time = -1 / arrivals_per_sec * math.log(1 - u)
+            interarrival_time = -1 / ARRIVALS_PER_SEC * math.log(1 - u)
             time.sleep(interarrival_time / SPEEDUP)
 
-            # TODO: Pick destination source weighted randomly (dests should be picked with different priorities
-            dest_rse_id = None
+            # Pick destination source weighted randomly (dests should be picked with different priorities)
+            dst_rse_idx = random.choices(range(len(all_rses)), weights=rse_weights, k=1)[0]
+            dst_rse = all_rses[dst_rse_idx]
+            dst_rse_id = all_rse_ids[dst_rse_idx]
 
-            # TODO: Create a rule that will result in new requests
+            # Create a rule that will result in new request
+            file = {'scope': mock_scope, 'name': 'lfn.' + generate_uuid(), 'type': 'FILE', 'bytes': 1, 'adler32': 'beefdead'}
+            did = {'scope': mock_scope, 'name': file['name']}
 
-    @transaction_session
+            # add file to all rses except dst
+            for rse_id in all_rse_ids:
+                if rse_id != dst_rse_id:
+                    add_replicas(rse_id=rse_id, files=[file], account=root_account)
+
+            rule_core.add_rule(dids=[did], account=root_account, copies=1, rse_expression=dst_rse, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
+            new_req = request_core.get_request_by_did(rse_id=dst_rse_id, **did)
+            assert new_req['state'] == RequestState.WAITING
+
+
+            requests = list_and_mark_transfer_requests_and_source_replicas(rse_collection=topology, rses=all_rse_ids)
+            [[_, transfer]] = pick_and_prepare_submission_path(topology=topology, protocol_factory=ProtocolFactory(),
+                                                                requests_with_sources=requests).items()
+
+            # unsure if above ever queues the request, so we manually add it
+            # may be able to queue it with preparer/submitter
+            src_rse_id = transfer[0].src.rse.id
+            _add_mock_queued_request(src_rse_id, dst_rse_id, did['bytes'])
+
+
+
+    @transactional_session
     def _do_transfers(*, session=None):
         """
         Does the transfers
@@ -472,6 +523,11 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
         while datetime.now() < end_time:
             # TODO
             pass
+            # nearest_completion <- min completion across all rse reqs
+            # sleep until min completion
+            # pop req off rse's queue
+            # repeat
+
 
     # Create threads to mock daemons
     request_creator = threading.Thread(target=_generate_requests)
