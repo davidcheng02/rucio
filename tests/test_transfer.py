@@ -455,6 +455,12 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     all_rses = [rse0, rse1, rse2, rse3, rse4, rse5, rse6]
     rse_weights = [random.random() for _ in range(len(all_rses))]
 
+    # create complete graph
+    for rse_id1 in all_rse_ids:
+        for rse_id2 in all_rse_ids:
+            if rse_id1 != rse_id2:
+                add_distance(rse_id1, rse_id2, distance=40)
+
     topology = Topology().configure_multihop()
 
     end_time = datetime.datetime.now() + datetime.timedelta(seconds=SIMULATED_SECONDS / SPEEDUP)
@@ -486,7 +492,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             dst_rse_id = all_rse_ids[dst_rse_idx]
 
             # Create a rule that will result in new request
-            file = {'scope': mock_scope, 'name': 'lfn.' + generate_uuid(), 'type': 'FILE', 'bytes': 1, 'adler32': 'beefdead'}
+            file = {'scope': mock_scope, 'name': 'lfn.' + generate_uuid(), 'type': 'FILE', 'bytes': 100, 'adler32': 'beefdead'}
             did = {'scope': mock_scope, 'name': file['name']}
 
             # add file to all rses except dst
@@ -495,7 +501,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                     add_replicas(rse_id=rse_id, files=[file], account=root_account)
 
             rule_core.add_rule(dids=[did], account=root_account, copies=1, rse_expression=dst_rse, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
-            _add_mock_queued_request(None, dst_rse_id, file['bytes'])
 
     def _submitter():
         GRACEFUL_STOP = threading.Event()
@@ -521,6 +526,8 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
 
                 # change state and src id of request to submitted state and selected src rse id
                 for transfer in transfers:
+                    request_id = transfer[0].rws.request_id
+
                     stmt = update(
                         models.Request
                     ).where(
@@ -539,7 +546,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                     rowcount = session.execute(stmt).rowcount
 
                     if rowcount == 0:
-                        print("Error: did not update any queued requests")
+                        print("Did not update any queued requests")
 
                 session.commit()
 
@@ -585,7 +592,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             # pop req off rse's queue
             # repeat
 
-
     # Create threads to mock daemons
     request_creator = threading.Thread(target=_generate_requests)
     request_creator.start()
@@ -603,12 +609,20 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
 
     stmt = select(
         models.Request
+    ).where(
+        models.Request.dest_rse_id.in_(all_rse_ids)
     )
 
     tmp = db_session.execute(stmt).scalars()
+    count = 0
 
     for request in tmp:
+        count += 1
+        print(f"source: {request['source_rse_id']}")
+        print(f"dest: {request['dest_rse_id']}")
         print(request['state'])
+
+    print(count)
 
 @pytest.mark.parametrize("caches_mock", [{"caches_to_mock": [
     'rucio.core.rse_expression_parser.REGION',  # The list of multihop RSEs is retrieved by an expression
