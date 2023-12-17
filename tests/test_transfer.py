@@ -18,6 +18,7 @@ import pytest
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import datetime
+from sqlalchemy import update
 
 from rucio.common.exception import NoDistance
 from rucio.core.distance import add_distance
@@ -33,8 +34,7 @@ from rucio.db.sqla.constants import RSEType, RequestState
 from rucio.db.sqla.session import get_session, transactional_session
 from rucio.common.utils import generate_uuid
 from rucio.daemons.conveyor.common import assign_paths_to_transfertool_and_create_hops, pick_and_prepare_submission_path
-from rucio.daemons.conveyor.preparer import preparer
-
+from rucio.daemons.common import db_workqueue, ProducerConsumerDaemon
 
 def _prepare_submission(rses):
     topology = Topology().configure_multihop()
@@ -429,17 +429,18 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     """
     Run simulations to test effectiveness of TransferWaitTime strategy
     """
-    # TODO: import threading, time, math
     import threading, time, math
 
+    db_session = get_session()
+
     # How much faster our simulation is relative to real time
-    SPEEDUP = 60
+    SPEEDUP = 240
 
     # TODO: get accurate value
-    ARRIVALS_PER_SEC = -1
+    ARRIVALS_PER_SEC = 1
 
     # In units of real time
-    SIMULATED_SECONDS = 3600 # 1 hours
+    SIMULATED_SECONDS = 3600 # 1 hour
 
     # no topology yet, just creating rses
     rse0, rse0_id = rse_factory.make_mock_rse()
@@ -457,10 +458,11 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     topology = Topology().configure_multihop()
 
     end_time = datetime.datetime.now() + datetime.timedelta(seconds=SIMULATED_SECONDS / SPEEDUP)
+    requests = []
 
     @transactional_session
     def _generate_requests(*, session=None):
-
+        @transactional_session
         def _add_mock_queued_request(src_rse_id: str, dst_rse_id: str, bytes: int, *, session=None):
             request = models.Request(
                 dest_rse_id=dst_rse_id,
@@ -469,6 +471,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                 bytes=bytes
             )
             request.save(session=session)
+            requests.append(request)
             session.expunge(request)
         """
         Generate requests following a Poisson distribution
@@ -476,7 +479,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
         while datetime.datetime.now() < end_time:
             # Interarrival time of Poisson is exponential
             # We can generate uniform random and invert the CDF of exponential to generate this
-            interarrival_time = -1 / ARRIVALS_PER_SEC * math.log(1 - u)
+            interarrival_time = -1 / ARRIVALS_PER_SEC * math.log(1 - random.random())
             time.sleep(interarrival_time / SPEEDUP)
 
             # Pick destination source weighted randomly (dests should be picked with different priorities)
@@ -494,20 +497,64 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                     add_replicas(rse_id=rse_id, files=[file], account=root_account)
 
             rule_core.add_rule(dids=[did], account=root_account, copies=1, rse_expression=dst_rse, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
-            new_req = request_core.get_request_by_did(rse_id=dst_rse_id, **did)
-            assert new_req['state'] == RequestState.WAITING
+            _add_mock_queued_request(None, dst_rse_id, file['bytes'])
 
+    def _submitter():
+        def _fetch_requests():
+            requests_with_sources = list_and_mark_transfer_requests_and_source_replicas(rse_collection=topology,
+                                                                                        rses=all_rse_ids)
 
-            requests = list_and_mark_transfer_requests_and_source_replicas(rse_collection=topology, rses=all_rse_ids)
-            [[_, transfer]] = pick_and_prepare_submission_path(topology=topology, protocol_factory=ProtocolFactory(),
-                                                                requests_with_sources=requests).items()
+            # TODO: should we also return must_sleep like submitter.py does in its _fetch_requests?
+            return requests_with_sources
 
-            # unsure if above ever queues the request, so we manually add it
-            # may be able to queue it with preparer/submitter
-            src_rse_id = transfer[0].src.rse.id
-            _add_mock_queued_request(src_rse_id, dst_rse_id, did['bytes'])
+        @transactional_session
+        def _handle_requests(requests_with_sources, *, session=None):
+            [[_, transfers]] = pick_and_prepare_submission_path(topology=topology, protocol_factory=ProtocolFactory(),
+                                                               requests_with_sources=requests_with_sources).items()
+            submitted_at = datetime.datetime.now()
 
+            # change state and src id of request to submitted state and selected src rse id
+            for transfer in transfers:
+                stmt = update(
+                    models.Request
+                ).where(
+                    models.Request.id == transfer[0].rws.request_id,
+                    models.Request.state == RequestState.QUEUED
+                ).execution_options(
+                    synchronize_session=False
+                ).values(
+                    {
+                        models.Request.state: RequestState.SUBMITTED,
+                        models.Request.source_rse_id: transfer[0].src.rse.id,
+                        models.Request.submitted_at: submitted_at,
+                    }
+                )
 
+                rowcount = session.execute(stmt).rowcount
+
+                if rowcount == 0:
+                    print("Error: did not update any queued requests")
+
+                session.commit()
+        @db_workqueue(
+            once=True,
+            graceful_stop=threading.Event(),
+            executable="",
+            partition_wait_time=2,
+            sleep_time=2,
+            activities=None,
+        )
+        def _producer():
+            return _fetch_requests()
+
+        def _consumer(batch):
+            return _handle_requests(batch, session=db_session)
+
+        ProducerConsumerDaemon(
+            producers=[_producer],
+            consumers=[_consumer],
+            graceful_stop=threading.Event(),
+        ).run()
 
     @transactional_session
     def _do_transfers(*, session=None):
@@ -520,7 +567,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
 
         It should be ~10 s per file and 10Mbps with some random noise
         """
-        while datetime.now() < end_time:
+        while datetime.datetime.now() < end_time:
             # TODO
             pass
             # nearest_completion <- min completion across all rse reqs
@@ -533,13 +580,15 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     request_creator = threading.Thread(target=_generate_requests)
     request_creator.start()
 
-    # TODO: use a preparer daemon that will choose source nodes (see test_conveyor.py)
     # TODO: we may have to put this test in test_conveyor.py or test_preparer.py
+    mock_submitter = threading.Thread(target=_submitter)
+    mock_submitter.start()
 
     mock_transfer_thread = threading.Thread(target=_do_transfers)
     mock_transfer_thread.start()
 
     request_creator.join()
+    mock_submitter.join()
     mock_transfer_thread.join()
 
 @pytest.mark.parametrize("caches_mock", [{"caches_to_mock": [
@@ -560,10 +609,8 @@ def test_multihop_requests_created(rse_factory, did_factory, root_account, cache
     did = did_factory.upload_test_file(rs0_name)
     rule_core.add_rule(dids=[did], account=root_account, copies=1, rse_expression=dst_rse_name, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
 
-    _prepare_submission(rses=[src_rse_id, dst_rse_id])
     # the intermediate request was correctly created
     assert request_core.get_request_by_did(rse_id=intermediate_rse_id, **did)
-
 
 @pytest.mark.parametrize("caches_mock", [{"caches_to_mock": [
     'rucio.core.rse_expression_parser.REGION',  # The list of multihop RSEs is retrieved by an expression
