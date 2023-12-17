@@ -18,7 +18,7 @@ import pytest
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import datetime
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from rucio.common.exception import NoDistance
 from rucio.core.distance import add_distance
@@ -434,7 +434,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     db_session = get_session()
 
     # How much faster our simulation is relative to real time
-    SPEEDUP = 240
+    SPEEDUP = 480
 
     # TODO: get accurate value
     ARRIVALS_PER_SEC = 1
@@ -458,7 +458,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     topology = Topology().configure_multihop()
 
     end_time = datetime.datetime.now() + datetime.timedelta(seconds=SIMULATED_SECONDS / SPEEDUP)
-    requests = []
 
     @transactional_session
     def _generate_requests(*, session=None):
@@ -471,7 +470,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                 bytes=bytes
             )
             request.save(session=session)
-            requests.append(request)
             session.expunge(request)
         """
         Generate requests following a Poisson distribution
@@ -500,51 +498,63 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             _add_mock_queued_request(None, dst_rse_id, file['bytes'])
 
     def _submitter():
+        GRACEFUL_STOP = threading.Event()
+
         def _fetch_requests():
+            print("fetching requests")
             requests_with_sources = list_and_mark_transfer_requests_and_source_replicas(rse_collection=topology,
                                                                                         rses=all_rse_ids)
 
-            # TODO: should we also return must_sleep like submitter.py does in its _fetch_requests?
-            return requests_with_sources
+            return False, requests_with_sources
 
         @transactional_session
         def _handle_requests(requests_with_sources, *, session=None):
-            [[_, transfers]] = pick_and_prepare_submission_path(topology=topology, protocol_factory=ProtocolFactory(),
-                                                               requests_with_sources=requests_with_sources).items()
-            submitted_at = datetime.datetime.now()
+            print("handling requests")
 
-            # change state and src id of request to submitted state and selected src rse id
-            for transfer in transfers:
-                stmt = update(
-                    models.Request
-                ).where(
-                    models.Request.id == transfer[0].rws.request_id,
-                    models.Request.state == RequestState.QUEUED
-                ).execution_options(
-                    synchronize_session=False
-                ).values(
-                    {
-                        models.Request.state: RequestState.SUBMITTED,
-                        models.Request.source_rse_id: transfer[0].src.rse.id,
-                        models.Request.submitted_at: submitted_at,
-                    }
-                )
+            payload = pick_and_prepare_submission_path(topology=topology, protocol_factory=ProtocolFactory(),
+                                                       requests_with_sources=requests_with_sources).items()
 
-                rowcount = session.execute(stmt).rowcount
+            if len(payload) > 0:
+                [[_, transfers]] = payload
 
-                if rowcount == 0:
-                    print("Error: did not update any queued requests")
+                submitted_at = datetime.datetime.now()
+
+                # change state and src id of request to submitted state and selected src rse id
+                for transfer in transfers:
+                    stmt = update(
+                        models.Request
+                    ).where(
+                        models.Request.id == transfer[0].rws.request_id,
+                        models.Request.state == RequestState.QUEUED
+                    ).execution_options(
+                        synchronize_session=False
+                    ).values(
+                        {
+                            models.Request.state: RequestState.SUBMITTED,
+                            models.Request.source_rse_id: transfer[0].src.rse.id,
+                            models.Request.submitted_at: submitted_at,
+                        }
+                    )
+
+                    rowcount = session.execute(stmt).rowcount
+
+                    if rowcount == 0:
+                        print("Error: did not update any queued requests")
 
                 session.commit()
+
+            if datetime.datetime.now() >= end_time:
+                GRACEFUL_STOP.set()
+
         @db_workqueue(
-            once=True,
-            graceful_stop=threading.Event(),
+            once=False,
+            graceful_stop=GRACEFUL_STOP,
             executable="",
             partition_wait_time=2,
             sleep_time=2,
             activities=None,
         )
-        def _producer():
+        def _producer(*, activity, heartbeat_handler):
             return _fetch_requests()
 
         def _consumer(batch):
@@ -553,7 +563,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
         ProducerConsumerDaemon(
             producers=[_producer],
             consumers=[_consumer],
-            graceful_stop=threading.Event(),
+            graceful_stop=GRACEFUL_STOP,
         ).run()
 
     @transactional_session
@@ -591,6 +601,15 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     mock_submitter.join()
     mock_transfer_thread.join()
 
+    stmt = select(
+        models.Request
+    )
+
+    tmp = db_session.execute(stmt).scalars()
+
+    for request in tmp:
+        print(request['state'])
+
 @pytest.mark.parametrize("caches_mock", [{"caches_to_mock": [
     'rucio.core.rse_expression_parser.REGION',  # The list of multihop RSEs is retrieved by an expression
 ]}], indirect=True)
@@ -609,6 +628,7 @@ def test_multihop_requests_created(rse_factory, did_factory, root_account, cache
     did = did_factory.upload_test_file(rs0_name)
     rule_core.add_rule(dids=[did], account=root_account, copies=1, rse_expression=dst_rse_name, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
 
+    _prepare_submission(rses=[src_rse_id, dst_rse_id])
     # the intermediate request was correctly created
     assert request_core.get_request_by_did(rse_id=intermediate_rse_id, **did)
 
