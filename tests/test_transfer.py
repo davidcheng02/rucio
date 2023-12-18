@@ -430,6 +430,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     Run simulations to test effectiveness of TransferWaitTime strategy
     """
     import threading, time, math
+    from collections import deque
 
     db_session = get_session()
 
@@ -584,13 +585,91 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
 
         It should be ~10 s per file and 10Mbps with some random noise
         """
+        def _mark_request_completed(req: models.Request):
+            time_completed = datetime.datetime.now()
+            stmt = update(
+                models.Request
+            ).where(
+                models.Request.id == req.id,
+                models.Request.state == RequestState.SUBMITTED
+            ).values(
+                {
+                    models.Request.state: RequestState.DONE,
+                    models.Request.transferred_at: time_completed,
+                }
+            )
+
+            session.execute(stmt)
+
+        class SourceTransferrer:
+            OVERHEAD = 10
+            TRANSFER_RATE = 10
+            def __init__(self, rse: str, rse_id: str):
+                self.rse = rse
+                self.rse_id = rse_id
+                # pair: (end time, request)
+                self.request_queue: deque[(datetime.date, models.Request)] = deque([])
+                self.requests_processing = set()
+
+            def next_completion(self) -> datetime.date:
+                if self.request_queue:
+                    if self.request_queue[0] is None:
+                        _, new_request = self.request_queue[0]
+                        completion_time = (datetime.datetime.now() + (new_request.bytes / self.TRANSFER_RATE + self.OVERHEAD) / SPEEDUP)
+                        self.request_queue[0] = (completion_time, new_request)
+                    return self.request_queue[0]
+
+            def add_to_queue(self, new_request: models.Request):
+                if new_request not in self.requests_processing:
+                    self.requests_processing.add(new_request.id)
+                    self.request_queue.append((None, new_request))
+
+            def check_queue(self):
+                if self.request_queue:
+                    next_completion, _ = self.next_completion()
+                    if next_completion is not None:
+                        if datetime.datetime.now() > next_completion:
+                            completed_request = self.request_queue.popleft()
+                            _mark_request_completed(completed_request)
+                            # this will start the next request's timer
+                            self.next_completion()
+                            return completed_request
+
+        # last_check = epoch
+        last_check = datetime.datetime.fromtimestamp(0)
+        st_map = {}
+        for rse, rse_id in zip(all_rses, all_rse_ids):
+            st_map[rse_id] = SourceTransferrer(rse, rse_id)
+
         while datetime.datetime.now() < end_time:
-            # TODO
-            pass
-            # nearest_completion <- min completion across all rse reqs
-            # sleep until min completion
-            # pop req off rse's queue
-            # repeat
+
+            # get all reqs newer than our last check
+            print("tyring to fetch")
+            stmt = select(
+                models.Request
+            ).where(
+                models.Request.state == RequestState.SUBMITTED,
+                models.Request.submitted_at > last_check
+            ).order_by(
+                models.Request.submitted_at.asc()
+            )
+
+            new_requests = session.execute(stmt)
+            print(new_requests)
+
+            for req in new_requests:
+                req: models.Request = req[0]
+                print(req)
+                last_check = max(last_check, req.submitted_at)
+                st_map[req.source_rse_id].add_to_queue(req)
+
+            for rse_id in all_rse_ids:
+                st_map[rse_id].check_queue()
+
+            # for debugging
+            time.sleep(0.5)
+
+
 
     # Create threads to mock daemons
     request_creator = threading.Thread(target=_generate_requests)
