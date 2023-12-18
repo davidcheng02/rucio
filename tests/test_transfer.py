@@ -435,9 +435,9 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     db_session = get_session()
 
     # How much faster our simulation is relative to real time
-    SPEEDUP = 120
+    SPEEDUP = 60
 
-    ARRIVALS_PER_SEC = 10
+    # ARRIVALS_PER_SEC = 10
 
     # In units of real time
     SIMULATED_SECONDS = 3600 # 1 hour
@@ -466,18 +466,17 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
 
     topology = Topology().configure_multihop()
 
-    end_time = datetime.datetime.now() + datetime.timedelta(seconds=SIMULATED_SECONDS / SPEEDUP)
-
     @transactional_session
     def _generate_requests(*, session=None):
         """
-        Generate requests following a Poisson distribution
+        Generate requests randomized by destination rse according to random weights
         """
-        while datetime.datetime.now() < end_time:
+        # while datetime.datetime.now() < end_time:
+        for i in range(100):
             # Interarrival time of Poisson is exponential
             # We can generate uniform random and invert the CDF of exponential to generate this
-            interarrival_time = -1 / ARRIVALS_PER_SEC * math.log(1 - random.random())
-            time.sleep(interarrival_time / SPEEDUP)
+            # interarrival_time = -1 / ARRIVALS_PER_SEC * math.log(1 - random.random())
+            # time.sleep(interarrival_time / SPEEDUP)
 
             # Pick destination source weighted randomly (dests should be picked with different priorities)
             dst_rse_idx = random.choices(range(len(all_rses)), weights=rse_weights, k=1)[0]
@@ -496,7 +495,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                     add_replicas(rse_id=rse_id, files=[file], account=root_account)
 
             rule_core.add_rule(dids=[did], account=root_account, copies=1, rse_expression=dst_rse, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
-
     def _submitter():
         while datetime.datetime.now() < end_time:
             requests_with_sources = list_and_mark_transfer_requests_and_source_replicas(rse_collection=topology,
@@ -642,8 +640,11 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                 st_map[rse_id].check_queue()
 
     # Create threads to mock daemons
-    request_creator = threading.Thread(target=_generate_requests)
-    request_creator.start()
+    # request_creator = threading.Thread(target=_generate_requests)
+    # request_creator.start()
+    _generate_requests()
+
+    end_time = datetime.datetime.now() + datetime.timedelta(seconds=SIMULATED_SECONDS / SPEEDUP)
 
     mock_submitter = threading.Thread(target=_submitter)
     mock_submitter.start()
@@ -651,7 +652,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     mock_transfer_thread = threading.Thread(target=_do_transfers)
     mock_transfer_thread.start()
 
-    request_creator.join()
+    # request_creator.join()
     mock_submitter.join()
     mock_transfer_thread.join()
 
@@ -674,10 +675,13 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             total_wait_time += (request['started_at'] - request['submitted_at']).total_seconds()*SPEEDUP
             total_transfer_time += (request['transferred_at'] - request['submitted_at']).total_seconds()*SPEEDUP
 
-    avg_wait_time = total_wait_time / requests_done
-    avg_transfer_time = total_transfer_time / requests_done
-    print(f"Average wait time: {avg_wait_time}")
-    print(f"Average transfer time: {avg_transfer_time}")
+    if requests_done > 0:
+        avg_wait_time = total_wait_time / requests_done
+        avg_transfer_time = total_transfer_time / requests_done
+        print()
+        print(f"Average wait time: {avg_wait_time}")
+        print(f"Average transfer time: {avg_transfer_time}")
+
     print(f"Requests done: {requests_done}")
 
 
