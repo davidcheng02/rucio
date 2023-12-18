@@ -435,7 +435,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     db_session = get_session()
 
     # How much faster our simulation is relative to real time
-    SPEEDUP = 480
+    SPEEDUP = 120
 
     # TODO: get accurate value
     ARRIVALS_PER_SEC = 1
@@ -507,7 +507,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
         GRACEFUL_STOP = threading.Event()
 
         def _fetch_requests():
-            print("fetching requests")
             requests_with_sources = list_and_mark_transfer_requests_and_source_replicas(rse_collection=topology,
                                                                                         rses=all_rse_ids)
 
@@ -515,8 +514,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
 
         @transactional_session
         def _handle_requests(requests_with_sources, *, session=None):
-            print("handling requests")
-
             payload = pick_and_prepare_submission_path(topology=topology, protocol_factory=ProtocolFactory(),
                                                        requests_with_sources=requests_with_sources).items()
 
@@ -602,6 +599,21 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             session.execute(stmt)
             session.commit()
 
+        def _mark_request_started(req: models.Request):
+            time_started = datetime.datetime.now()
+            stmt = update(
+                models.Request
+            ).where(
+                models.Request.id == req.id,
+                models.Request.state == RequestState.SUBMITTED
+            ).values(
+                {
+                    models.Request.started_at: time_started,
+                }
+            )
+
+            session.execute(stmt)
+            session.commit()
         class SourceTransferrer:
             OVERHEAD = 10
             TRANSFER_RATE = 10*(10**6) / 8
@@ -617,7 +629,8 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                     completion_time, new_request = self.request_queue[0]
 
                     if completion_time is None:
-                        completion_time = datetime.datetime.now() + datetime.timedelta(seconds=((new_request.bytes / self.TRANSFER_RATE + self.OVERHEAD) / SPEEDUP))
+                        _mark_request_started(new_request)
+                        completion_time = new_request.started_at + datetime.timedelta(seconds=((new_request.bytes / self.TRANSFER_RATE + self.OVERHEAD) / SPEEDUP))
                         self.request_queue[0] = (completion_time, new_request)
 
                     return self.request_queue[0]
@@ -647,7 +660,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
         while datetime.datetime.now() < end_time:
 
             # get all reqs newer than our last check
-            print("trying to fetch")
             stmt = select(
                 models.Request
             ).where(
@@ -671,8 +683,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             # for debugging
             time.sleep(0.5)
 
-
-
     # Create threads to mock daemons
     request_creator = threading.Thread(target=_generate_requests)
     request_creator.start()
@@ -688,6 +698,10 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     mock_submitter.join()
     mock_transfer_thread.join()
 
+    # measure time metrics
+    total_wait_time = 0
+    total_transfer_time = 0
+
     stmt = select(
         models.Request
     ).where(
@@ -695,16 +709,19 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     )
 
     tmp = db_session.execute(stmt).scalars()
-    count = 0
+    requests_done = 0
 
     for request in tmp:
-        count += 1
-        print(f"source: {request['source_rse_id']}")
-        print(f"dest: {request['dest_rse_id']}")
-        print(request['state'])
-        print(f"submitted_at: {request['submitted_at']}")
+        if request['state'] == RequestState.DONE:
+            requests_done += 1
+            total_wait_time += (request['started_at'] - request['submitted_at']).total_seconds()
+            total_transfer_time += (request['transferred_at'] - request['submitted_at']).total_seconds()
 
-    print(count)
+    avg_wait_time = total_wait_time / requests_done
+    avg_transfer_time = total_transfer_time / requests_done
+    print(f"Average wait time: {avg_wait_time}")
+    print(f"Average transfer time: {avg_transfer_time}")
+
 
 @pytest.mark.parametrize("caches_mock", [{"caches_to_mock": [
     'rucio.core.rse_expression_parser.REGION',  # The list of multihop RSEs is retrieved by an expression
