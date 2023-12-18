@@ -437,13 +437,11 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     # How much faster our simulation is relative to real time
     SPEEDUP = 120
 
-    # TODO: get accurate value
-    ARRIVALS_PER_SEC = 1
+    ARRIVALS_PER_SEC = 10
 
     # In units of real time
     SIMULATED_SECONDS = 3600 # 1 hour
 
-    # no topology yet, just creating rses
     rse0, rse0_id = rse_factory.make_mock_rse()
     rse1, rse1_id = rse_factory.make_mock_rse()
     rse2, rse2_id = rse_factory.make_mock_rse()
@@ -456,11 +454,15 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     all_rses = [rse0, rse1, rse2, rse3, rse4, rse5, rse6]
     rse_weights = [random.random() for _ in range(len(all_rses))]
 
+    for rse_id in all_rse_ids:
+        rse_core.add_rse_attribute(rse_id, 'available_for_multihop', True)
+
     # create complete graph
     for rse_id1 in all_rse_ids:
         for rse_id2 in all_rse_ids:
             if rse_id1 != rse_id2:
-                add_distance(rse_id1, rse_id2, distance=40)
+                if random.random() < 0.75:
+                    add_distance(rse_id1, rse_id2, distance=random.randrange(100))
 
     topology = Topology().configure_multihop()
 
@@ -468,16 +470,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
 
     @transactional_session
     def _generate_requests(*, session=None):
-        @transactional_session
-        def _add_mock_queued_request(src_rse_id: str, dst_rse_id: str, bytes: int, *, session=None):
-            request = models.Request(
-                dest_rse_id=dst_rse_id,
-                source_rse_id=src_rse_id,
-                state=RequestState.QUEUED,
-                bytes=bytes
-            )
-            request.save(session=session)
-            session.expunge(request)
         """
         Generate requests following a Poisson distribution
         """
@@ -492,8 +484,10 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             dst_rse = all_rses[dst_rse_idx]
             dst_rse_id = all_rse_ids[dst_rse_idx]
 
+            # largest file will take 80 sec to transfer over wire (excluding overhead)
+            MAX_FILE_SIZE_BYTES = 10**8
             # Create a rule that will result in new request
-            file = {'scope': mock_scope, 'name': 'lfn.' + generate_uuid(), 'type': 'FILE', 'bytes': 100, 'adler32': 'beefdead'}
+            file = {'scope': mock_scope, 'name': 'lfn.' + generate_uuid(), 'type': 'FILE', 'bytes': random.randrange(MAX_FILE_SIZE_BYTES), 'adler32': 'beefdead'}
             did = {'scope': mock_scope, 'name': file['name']}
 
             # add file to all rses except dst
@@ -504,16 +498,9 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             rule_core.add_rule(dids=[did], account=root_account, copies=1, rse_expression=dst_rse, grouping='ALL', weight=None, lifetime=None, locked=False, subscription_id=None)
 
     def _submitter():
-        GRACEFUL_STOP = threading.Event()
-
-        def _fetch_requests():
+        while datetime.datetime.now() < end_time:
             requests_with_sources = list_and_mark_transfer_requests_and_source_replicas(rse_collection=topology,
                                                                                         rses=all_rse_ids)
-
-            return False, requests_with_sources
-
-        @transactional_session
-        def _handle_requests(requests_with_sources, *, session=None):
             payload = pick_and_prepare_submission_path(topology=topology, protocol_factory=ProtocolFactory(),
                                                        requests_with_sources=requests_with_sources).items()
 
@@ -524,8 +511,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
 
                 # change state and src id of request to submitted state and selected src rse id
                 for transfer in transfers:
-                    request_id = transfer[0].rws.request_id
-
                     stmt = update(
                         models.Request
                     ).where(
@@ -541,35 +526,12 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                         }
                     )
 
-                    rowcount = session.execute(stmt).rowcount
+                    rowcount = db_session.execute(stmt).rowcount
 
-                    if rowcount == 0:
-                        print("Did not update any queued requests")
+                    # if rowcount == 0:
+                    # print("Did not update any queued requests")
 
-                session.commit()
-
-            if datetime.datetime.now() >= end_time:
-                GRACEFUL_STOP.set()
-
-        @db_workqueue(
-            once=False,
-            graceful_stop=GRACEFUL_STOP,
-            executable="",
-            partition_wait_time=0,
-            sleep_time=0,
-            activities=None,
-        )
-        def _producer(*, activity, heartbeat_handler):
-            return _fetch_requests()
-
-        def _consumer(batch):
-            return _handle_requests(batch, session=db_session)
-
-        ProducerConsumerDaemon(
-            producers=[_producer],
-            consumers=[_consumer],
-            graceful_stop=GRACEFUL_STOP,
-        ).run()
+                db_session.commit()
 
     @transactional_session
     def _do_transfers(*, session=None):
@@ -658,7 +620,6 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             st_map[rse_id] = SourceTransferrer(rse, rse_id)
 
         while datetime.datetime.now() < end_time:
-
             # get all reqs newer than our last check
             stmt = select(
                 models.Request
@@ -680,14 +641,10 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             for rse_id in all_rse_ids:
                 st_map[rse_id].check_queue()
 
-            # for debugging
-            time.sleep(0.5)
-
     # Create threads to mock daemons
     request_creator = threading.Thread(target=_generate_requests)
     request_creator.start()
 
-    # TODO: we may have to put this test in test_conveyor.py or test_preparer.py
     mock_submitter = threading.Thread(target=_submitter)
     mock_submitter.start()
 
@@ -714,13 +671,14 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
     for request in tmp:
         if request['state'] == RequestState.DONE:
             requests_done += 1
-            total_wait_time += (request['started_at'] - request['submitted_at']).total_seconds()
-            total_transfer_time += (request['transferred_at'] - request['submitted_at']).total_seconds()
+            total_wait_time += (request['started_at'] - request['submitted_at']).total_seconds()*SPEEDUP
+            total_transfer_time += (request['transferred_at'] - request['submitted_at']).total_seconds()*SPEEDUP
 
     avg_wait_time = total_wait_time / requests_done
     avg_transfer_time = total_transfer_time / requests_done
     print(f"Average wait time: {avg_wait_time}")
     print(f"Average transfer time: {avg_transfer_time}")
+    print(f"Requests done: {requests_done}")
 
 
 @pytest.mark.parametrize("caches_mock", [{"caches_to_mock": [

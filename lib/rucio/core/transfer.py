@@ -1111,6 +1111,8 @@ class TransferWaitTime(SourceRankingStrategy):
                 src_bytes_queued += stat.bytes
 
             wait_by_rse[src.rse] = src_files_queued * self.FILE_OVERHEAD_MS + src_bytes_queued * self.PER_BYTE_MS
+            # For sources with no queue, give them a non-zero value so that weighting works out nicely
+            wait_by_rse[src.rse] = max(wait_by_rse[src.rse], self.PER_BYTE_MS)
 
         costs = defaultdict(int)
         total_wait = sum(wait_by_rse.values())
@@ -1121,22 +1123,22 @@ class TransferWaitTime(SourceRankingStrategy):
 
         # Use the solution to the weighted random sampling (WRS) problem to rank sources among each other. Each source
         # computes a weighted random key where larger keys are higher ranked. Smaller wait times are better so we
-        # calculate weight by normalizing wait and then subtracting from 1. We weight above average and below average
-        # wait time sources differently.
+        # calculate weight by taking reciprocal and normalizing. We weight above average and below average wait time
+        # sources differently.
         # Reference: Weighted Random Sampling (2005; Efraimidis, Spirakis)
         avg_wait = total_wait / len(wait_by_rse)
-        above_avg_total_wait = sum([wait for wait in wait_by_rse.values() if wait >= avg_wait])
-        below_avg_total_wait = sum([wait for wait in wait_by_rse.values() if wait < avg_wait])
+        above_avg_norm_wait = sum([1 / wait for wait in wait_by_rse.values() if wait >= avg_wait])
+        below_avg_norm_wait = sum([1 / wait for wait in wait_by_rse.values() if wait < avg_wait])
 
         for src, wait in wait_by_rse.items():
             if wait >= avg_wait:
-                norm_wait = above_avg_total_wait
+                norm_wait = above_avg_norm_wait
                 exploration = self.ABOVE_AVG_EXPLORATION
             else:
-                norm_wait = below_avg_total_wait
+                norm_wait = below_avg_norm_wait
                 exploration = 1 - self.ABOVE_AVG_EXPLORATION
 
-            weight = exploration * (1 - wait / norm_wait)
+            weight = exploration * ((1 / wait) / norm_wait)
             # Ensure weight is not 0
             weight = max(weight, 10 ** -9)
             key = random.random() ** (1.0 / weight)
