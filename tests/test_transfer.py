@@ -558,8 +558,8 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             once=False,
             graceful_stop=GRACEFUL_STOP,
             executable="",
-            partition_wait_time=2,
-            sleep_time=2,
+            partition_wait_time=0,
+            sleep_time=0,
             activities=None,
         )
         def _producer(*, activity, heartbeat_handler):
@@ -600,10 +600,11 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
             )
 
             session.execute(stmt)
+            session.commit()
 
         class SourceTransferrer:
             OVERHEAD = 10
-            TRANSFER_RATE = 10
+            TRANSFER_RATE = 10*(10**6) / 8
             def __init__(self, rse: str, rse_id: str):
                 self.rse = rse
                 self.rse_id = rse_id
@@ -611,12 +612,14 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                 self.request_queue: deque[(datetime.date, models.Request)] = deque([])
                 self.requests_processing = set()
 
-            def next_completion(self) -> datetime.date:
+            def next_completion(self) -> (datetime.date, models.Request):
                 if self.request_queue:
-                    if self.request_queue[0] is None:
-                        _, new_request = self.request_queue[0]
-                        completion_time = (datetime.datetime.now() + (new_request.bytes / self.TRANSFER_RATE + self.OVERHEAD) / SPEEDUP)
+                    completion_time, new_request = self.request_queue[0]
+
+                    if completion_time is None:
+                        completion_time = datetime.datetime.now() + datetime.timedelta(seconds=((new_request.bytes / self.TRANSFER_RATE + self.OVERHEAD) / SPEEDUP))
                         self.request_queue[0] = (completion_time, new_request)
+
                     return self.request_queue[0]
 
             def add_to_queue(self, new_request: models.Request):
@@ -629,7 +632,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
                     next_completion, _ = self.next_completion()
                     if next_completion is not None:
                         if datetime.datetime.now() > next_completion:
-                            completed_request = self.request_queue.popleft()
+                            _, completed_request = self.request_queue.popleft()
                             _mark_request_completed(completed_request)
                             # this will start the next request's timer
                             self.next_completion()
@@ -644,22 +647,21 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
         while datetime.datetime.now() < end_time:
 
             # get all reqs newer than our last check
-            print("tyring to fetch")
+            print("trying to fetch")
             stmt = select(
                 models.Request
             ).where(
                 models.Request.state == RequestState.SUBMITTED,
-                models.Request.submitted_at > last_check
+                models.Request.submitted_at > last_check,
+                models.Request.dest_rse_id.in_(all_rse_ids)
             ).order_by(
                 models.Request.submitted_at.asc()
             )
 
             new_requests = session.execute(stmt)
-            print(new_requests)
 
             for req in new_requests:
                 req: models.Request = req[0]
-                print(req)
                 last_check = max(last_check, req.submitted_at)
                 st_map[req.source_rse_id].add_to_queue(req)
 
@@ -700,6 +702,7 @@ def test_wait_time_simulation(rse_factory, root_account, mock_scope, file_config
         print(f"source: {request['source_rse_id']}")
         print(f"dest: {request['dest_rse_id']}")
         print(request['state'])
+        print(f"submitted_at: {request['submitted_at']}")
 
     print(count)
 
